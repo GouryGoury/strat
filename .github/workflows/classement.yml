@@ -26,6 +26,8 @@ jobs:
         env:
           CR_API_TOKEN: ${{ secrets.CR_API_TOKEN }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          # Secret facultatif : pour publier dans un salon different
+          DISCORD_WEBHOOK_CLASSEMENT: ${{ secrets.DISCORD_WEBHOOK_CLASSEMENT }}
         run: python gdc.py
 
       # Toujours execute, meme si l'etape precedente a echoue : les deux
