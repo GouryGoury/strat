@@ -1,0 +1,12 @@
+# NE JAMAIS envoyer ces fichiers sur un depot public :
+cr_token.txt
+discord_webhook.txt
+
+# message_simulateur.json est VOLONTAIREMENT versionne : il porte
+# l'identifiant du message Discord a reecrire d'une tache a l'autre.
+
+# fichiers de travail locaux
+journal.log
+classement_saison_*.txt
+course_brute.json
+*.tmp
