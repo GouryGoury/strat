@@ -84,6 +84,9 @@ MARGE_CONFORTABLE = 500      # au-dela, l'ecart realiste est juge sur
 
 BASE_URL = "https://proxy.royaleapi.dev/v1"
 NOM_BOT  = "Simulateur GDC"
+AFFICHAGE = "mobile"   # "mobile" : une fiche par clan, lisible sur telephone
+                       # "large"  : tableau en colonnes, pour grand ecran
+                       # (l'option --large force le tableau ponctuellement)
 
 DOSSIER   = os.path.dirname(os.path.abspath(__file__))
 F_TOKEN   = os.path.join(DOSSIER, "cr_token.txt")
@@ -321,25 +324,24 @@ def lignes_plan(nous, plan):
         return ["Plus aucun combat disponible aujourd'hui."]
     sur = nous.get("decks_dispo", restants)
     entames = nous.get("decks_entames", 0)
-    tete = "Il reste {} combat(s)".format(restants)
+    tete = "Il reste **{}** combats".format(restants)
     if entames:
-        tete += ", dont {} surs et {} coinces chez des joueurs deja lances".format(
-            sur, entames)
-    out = [tete + ". Budget bateau garanti, meme si tout le reste est perdu :"]
+        tete += " : {} surs, {} entames".format(sur, entames)
+    out = [tete + ". Budget bateau garanti :"]
     for v, b in plan:
-        quand = "maintenant" if v == 0 else "apres {} combat(s) gagne(s)".format(v)
+        quand = "maintenant" if v == 0 else "apres {} victoire(s)".format(v)
         if b == 0:
-            quoi = "aucun bateau, que des combats classiques"
+            quoi = "aucun, que des combats"
         elif b >= restants - v:
-            quoi = "tout le reste peut passer sur les bateaux"
+            quoi = "tout le reste possible"
         else:
-            quoi = "{} deck(s) sur les bateaux".format(b)
-        out.append("  {:<26} {}".format(quand, quoi))
+            quoi = "{} deck(s)".format(b)
+        out.append("- {} : {}".format(quand, quoi))
     if len(plan) > 1 and plan[0][1] == 0:
-        out.append("Autrement dit : commence par les combats classiques, "
-                   "chaque victoire debloque du budget.")
+        out.append("Commence par les combats classiques : chaque victoire "
+                   "debloque du budget.")
     if entames:
-        out.append("Les {} decks entames ne sont pas comptes dans le plancher : "
+        out.append("-# Les {} decks entames ne comptent pas dans le plancher : "
                    "eux seuls peuvent les finir.".format(entames))
     return out
 
@@ -380,39 +382,63 @@ def duree_lisible(d):
     return "{} h {:02d}".format(total // 3600, (total % 3600) // 60)
 
 
-def construire_message(data, clans):
-    nous = next((c for c in clans
-                 if c["tag"].lstrip("#") == CLAN_TAG.lstrip("#").upper()), None)
-    adversaires = [c for c in clans if c is not nous]
-    classement = sorted(clans, key=lambda c: -c["score"])
-
+def tableau_large(clans, nous):
+    """Tableau en colonnes : lisible sur PC, illisible sur telephone."""
     lp = max([largeur(c["nom"]) for c in clans] + [12])
     gabarit = "{} {:>7} {:>6} {:>6} {:>7} {:>8} {:>8} {:>8}"
     lignes = [gabarit.format(cadrer("CLAN", lp), "SCORE", "JOUES", "DISPO",
                              "ENTAMES", "PLANCHER", "MOYEN", "PLAFOND")]
-    lignes.append("-" * len(lignes[0]))
-    for c in classement:
+    lignes.append("-" * largeur(lignes[0]))
+    for c in sorted(clans, key=lambda x: -x["score"]):
         marque = ">" if c is nous else " "
         lignes.append(gabarit.format(
             marque + cadrer(c["nom"], lp - 1), fmt(c["score"]),
             c["decks_faits"], c["decks_dispo"], c["decks_entames"],
             fmt(c["plancher"]), fmt(c["moyenne"]), fmt(c["plafond"])))
+    return lignes
+
+
+def tableau_mobile(clans, nous):
+    """Une fiche de 3 lignes par clan, chacune sous les ~33 caracteres que
+    Discord affiche sur telephone avant de renvoyer a la ligne."""
+    lignes = ["      plancher < moyen < plafond"]
+    for rang, c in enumerate(sorted(clans, key=lambda x: -x["score"]), 1):
+        marque = ">" if c is nous else " "
+        lignes.append("")
+        lignes.append("{}{} {} {}".format(
+            rang, marque, cadrer(c["nom"], 19), fmt(c["score"]).rjust(7)))
+        lignes.append("   {:>3} joues {:>4} dispo {:>3} ent".format(
+            c["decks_faits"], c["decks_dispo"], c["decks_entames"]))
+        lignes.append("   {} < {} < {}".format(
+            fmt(c["plancher"]).rjust(6), fmt(c["moyenne"]).rjust(6),
+            fmt(c["plafond"]).rjust(6)))
+    return lignes
+
+
+def construire_message(data, clans, large=False):
+    nous = next((c for c in clans
+                 if c["tag"].lstrip("#") == CLAN_TAG.lstrip("#").upper()), None)
+    adversaires = [c for c in clans if c is not nous]
 
     semaine = (data.get("sectionIndex", 0) or 0) + 1
-    entete = "**GUERRE DE CLAN - JOURNEE EN COURS** (semaine {}, fin dans {})".format(
+    corps = "**GUERRE DE CLAN - JOURNEE EN COURS**\n(semaine {}, fin dans {})".format(
         semaine, duree_lisible(temps_restant()))
 
-    corps = entete + "\n```\n" + "\n".join(lignes) + "\n```"
+    mode_large = large or AFFICHAGE == "large"
+    lignes = tableau_large(clans, nous) if mode_large else tableau_mobile(clans, nous)
+    corps += "\n```\n" + "\n".join(lignes) + "\n```"
 
     if nous:
         etiquette, explication, plan = verdict(nous, adversaires)
         corps += "\n**{}** - {}".format(etiquette, explication)
-        corps += "\n```\n" + "\n".join(lignes_plan(nous, plan)) + "\n```"
+        # le plan reste en texte normal : il se replie proprement sur mobile,
+        # contrairement a un bloc de code
+        corps += "\n" + "\n".join(lignes_plan(nous, plan))
         if not all(c["detaille"] for c in clans):
-            corps += "\n-# Certains clans n'exposent pas le detail par joueur : " \
-                     "leurs projections sont approchees."
-    corps += "\n-# PLANCHER = tout est perdu et les decks deja entames ne sont "\
-             "jamais termines. MOYEN et PLAFOND supposent tous les decks joues."
+            corps += "\n-# Projections approchees pour les clans sans detail " \
+                     "par joueur."
+    corps += "\n-# PLANCHER = tout est perdu et les decks entames ne sont jamais " \
+             "termines. MOYEN et PLAFOND supposent tous les decks joues."
     corps += "\n-# Mis a jour a {} - prochaine actualisation dans {} min".format(
         datetime.now().strftime("%H:%M"), intervalle_courant())
     return corps
@@ -482,7 +508,7 @@ def un_passage(args):
         return False
 
     clans = [projeter(c) for c in bruts]
-    message = construire_message(data, clans)
+    message = construire_message(data, clans, large=args.large)
 
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -523,6 +549,8 @@ def main():
                     help="compte a rebours lu sur RoyaleAPI, pour regler l'heure de bascule")
     ap.add_argument("--une-fois", action="store_true", help="un seul calcul")
     ap.add_argument("--sans-discord", action="store_true", help="console uniquement")
+    ap.add_argument("--large", action="store_true",
+                    help="tableau en colonnes (grand ecran) au lieu des fiches")
     ap.add_argument("--intervalle", type=int,
                     help="forcer un intervalle fixe, en minutes")
     ap.add_argument("--heures", type=float,
