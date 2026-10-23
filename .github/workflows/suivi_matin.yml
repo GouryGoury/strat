@@ -27,6 +27,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Installer Pillow (rendu du tableau en image)
+        run: pip install --quiet pillow
+
       - name: Suivi jusqu'a 2 h de la fin
         env:
           CR_API_TOKEN: ${{ secrets.CR_API_TOKEN }}
