@@ -1,0 +1,38 @@
+name: Classement de fin de saison
+
+# Lundi 13h00 UTC = 14h00 en France l'hiver, 15h00 l'ete.
+# Le script ne publie que si une saison vient reellement de se terminer.
+on:
+  schedule:
+    - cron: "0 13 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write           # pour memoriser les saisons deja publiees
+
+jobs:
+  classement:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Publier si une saison est terminee
+        env:
+          CR_API_TOKEN: ${{ secrets.CR_API_TOKEN }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: python gdc.py
+
+      # deja_publie.json doit survivre d'une execution a l'autre, sinon le
+      # classement serait republie chaque lundi.
+      - name: Memoriser les saisons publiees
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deja_publie.json || true
+          git commit -m "saison publiee" || exit 0
+          git push
