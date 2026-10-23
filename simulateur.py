@@ -72,7 +72,8 @@ PALIERS = [
     (180, 20),     # de -3h a -2h
     (360, 60),     # de -6h a -3h
 ]
-HORS_FENETRE_MIN  = 360      # au-dela, on attend sans rien faire
+HORS_FENETRE_MIN  = 360      # debut de la fenetre de suivi, en minutes avant la fin
+TOLERANCE_MIN     = 20       # marge de demarrage anticipe acceptee
 # Heure UTC a laquelle la journee de guerre bascule. Tout est calcule en UTC :
 # le passage a l'heure d'hiver ne decale donc rien. Pour trouver les bonnes
 # valeurs, lis le compte a rebours sur RoyaleAPI et lance :
@@ -371,8 +372,6 @@ def attente_prochaine(force=None):
     """Secondes a attendre avant le prochain passage, sans jamais depasser la
     bascule ni rafraichir trop tot avant l'ouverture de la fenetre."""
     restant = temps_restant().total_seconds()
-    if restant / 60 > HORS_FENETRE_MIN:
-        return (restant - HORS_FENETRE_MIN * 60)        # on dort jusqu'a -6h
     return max(30, min(intervalle_courant(force) * 60, restant - 30))
 
 
@@ -556,6 +555,17 @@ def main():
     if arret:
         print("Arret programme quand il restera {} minutes.".format(args.arret_a))
     print("Ctrl+C pour arreter.\n")
+    # Lance trop tot (test manuel en pleine journee, par exemple), le script
+    # publie un etat puis s'arrete : il ne reste pas a dormir des heures, ce
+    # qui ferait echouer la tache GitHub sur son delai maximum.
+    if temps_restant().total_seconds() / 60 > HORS_FENETRE_MIN + TOLERANCE_MIN:
+        print("Il reste {} avant la bascule, soit plus que la fenetre de suivi "
+              "de {} h.".format(duree_lisible(temps_restant()),
+                                HORS_FENETRE_MIN // 60))
+        print("Publication d'un etat ponctuel, puis arret.")
+        un_passage(args)
+        return
+
     try:
         while temps_restant().total_seconds() > max(60, arret):
             un_passage(args)
