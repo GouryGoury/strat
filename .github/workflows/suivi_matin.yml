@@ -1,0 +1,47 @@
+name: Suivi GDC - matin
+
+# La guerre de clan va du jeudi 20h au lundi. Les journees de guerre se
+# terminent donc le vendredi, samedi, dimanche et lundi vers 09h45 UTC.
+#
+# Ce premier suivi couvre -6h a -2h (cadence 1 h puis 20 min). La derniere
+# ligne droite est prise en charge par suivi_final.yml : GitHub limite un job
+# a 6 heures, d'ou le decoupage en deux.
+#
+# Si l'heure de bascule change, decaler ce cron ET celui de suivi_final.yml.
+# Ici : 03h45 UTC = bascule (09h45 UTC) moins 6 heures.
+on:
+  schedule:
+    - cron: "45 3 * * 5,6,0,1"     # vendredi, samedi, dimanche, lundi
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  suivi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Suivi jusqu'a 2 h de la fin
+        env:
+          CR_API_TOKEN: ${{ secrets.CR_API_TOKEN }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: python simulateur.py --arret-a 120
+
+      # L'identifiant du message Discord est conserve dans le depot pour que
+      # suivi_final.yml reecrive LE MEME message au lieu d'en creer un second.
+      - name: Memoriser le message et tracer l'activite
+        if: always()
+        run: |
+          date -u +"Derniere execution : %Y-%m-%d %H:%M UTC" > derniere_execution.txt
+          git config user.name "github-actions"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add derniere_execution.txt message_simulateur.json || true
+          git commit -m "suivi matin $(date -u +%F)" || exit 0
+          git pull --rebase --autostash || true
+          git push
