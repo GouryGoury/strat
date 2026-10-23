@@ -84,9 +84,23 @@ MARGE_CONFORTABLE = 500      # au-dela, l'ecart realiste est juge sur
 
 BASE_URL = "https://proxy.royaleapi.dev/v1"
 NOM_BOT  = "Simulateur GDC"
-AFFICHAGE = "mobile"   # "mobile" : une fiche par clan, lisible sur telephone
-                       # "large"  : tableau en colonnes, pour grand ecran
-                       # (l'option --large force le tableau ponctuellement)
+NOM_IMAGE = "tableau_gdc.png"
+# Mise en forme du tableau dans Discord :
+#   "image"  : tableau en colonnes envoye en PNG, lisible et zoomable partout
+#              (necessite Pillow : pip install pillow)
+#   "mobile" : fiches de 3 lignes en texte, sans dependance
+#   "large"  : tableau en colonnes en texte, illisible sur telephone
+# Si Pillow manque, "image" retombe automatiquement sur "mobile".
+AFFICHAGE = "image"
+
+# --- apparence de l'image (teintes du theme sombre de Discord) -------------
+IMG_FOND     = (43, 45, 49)
+IMG_TEXTE    = (219, 222, 225)
+IMG_ENTETE   = (148, 155, 164)
+IMG_NOUS     = (254, 231, 92)
+IMG_LIGNE    = (60, 63, 68)
+IMG_TAILLE   = 20          # taille de police
+IMG_MARGE    = 18
 
 DOSSIER   = os.path.dirname(os.path.abspath(__file__))
 F_TOKEN   = os.path.join(DOSSIER, "cr_token.txt")
@@ -384,7 +398,8 @@ def duree_lisible(d):
 
 def tableau_large(clans, nous):
     """Tableau en colonnes : lisible sur PC, illisible sur telephone."""
-    lp = max([largeur(c["nom"]) for c in clans] + [12])
+    # +1 pour le marqueur ">" : sans cela le nom du clan serait tronque
+    lp = max([largeur(c["nom"]) for c in clans] + [12]) + 1
     gabarit = "{} {:>7} {:>6} {:>6} {:>7} {:>8} {:>8} {:>8}"
     lignes = [gabarit.format(cadrer("CLAN", lp), "SCORE", "JOUES", "DISPO",
                              "ENTAMES", "PLANCHER", "MOYEN", "PLAFOND")]
@@ -415,7 +430,7 @@ def tableau_mobile(clans, nous):
     return lignes
 
 
-def construire_message(data, clans, large=False):
+def construire_message(data, clans, large=False, sans_image=False):
     nous = next((c for c in clans
                  if c["tag"].lstrip("#") == CLAN_TAG.lstrip("#").upper()), None)
     adversaires = [c for c in clans if c is not nous]
@@ -424,9 +439,17 @@ def construire_message(data, clans, large=False):
     corps = "**GUERRE DE CLAN - JOURNEE EN COURS**\n(semaine {}, fin dans {})".format(
         semaine, duree_lisible(temps_restant()))
 
-    mode_large = large or AFFICHAGE == "large"
-    lignes = tableau_large(clans, nous) if mode_large else tableau_mobile(clans, nous)
-    corps += "\n```\n" + "\n".join(lignes) + "\n```"
+    mode = "large" if large else AFFICHAGE
+    image = None
+    if mode == "image" and not sans_image:
+        image = generer_image(clans, nous, "Semaine {} - fin dans {}".format(
+            semaine, duree_lisible(temps_restant())))
+        if image is None:               # Pillow absent : repli silencieux
+            mode = "mobile"
+    if image is None:
+        lignes = tableau_large(clans, nous) if mode == "large" \
+            else tableau_mobile(clans, nous)
+        corps += "\n```\n" + "\n".join(lignes) + "\n```"
 
     if nous:
         etiquette, explication, plan = verdict(nous, adversaires)
@@ -441,7 +464,80 @@ def construire_message(data, clans, large=False):
              "termines. MOYEN et PLAFOND supposent tous les decks joues."
     corps += "\n-# Mis a jour a {} - prochaine actualisation dans {} min".format(
         datetime.now().strftime("%H:%M"), intervalle_courant())
-    return corps
+    return corps, image
+
+
+# --------------------------------------------------------------------------
+# Tableau en image (facultatif)
+# --------------------------------------------------------------------------
+
+def _police(taille, gras=False):
+    """Cherche une police a chasse fixe installee ; a defaut, celle de Pillow."""
+    from PIL import ImageFont
+    pistes = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono{}.ttf".format(
+            "-Bold" if gras else ""),
+        "/usr/share/fonts/TTF/DejaVuSansMono{}.ttf".format(
+            "-Bold" if gras else ""),
+        "C:\\Windows\\Fonts\\{}".format("consolab.ttf" if gras else "consola.ttf"),
+        "C:\\Windows\\Fonts\\{}".format("courbd.ttf" if gras else "cour.ttf"),
+        "/System/Library/Fonts/Menlo.ttc",
+    ]
+    for p in pistes:
+        try:
+            return ImageFont.truetype(p, taille)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size=taille)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def generer_image(clans, nous, titre):
+    """Rend le tableau large en PNG. Renvoie des octets, ou None si Pillow
+    n'est pas installe."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return None
+
+    lignes = tableau_large(clans, nous)
+    police = _police(IMG_TAILLE)
+    gras = _police(IMG_TAILLE, gras=True)
+
+    sonde = Image.new("RGB", (10, 10))
+    d = ImageDraw.Draw(sonde)
+    larg_car = d.textlength("0", font=police)
+    hauteur = IMG_TAILLE + 8
+
+    colonnes = max(len(l) for l in lignes + [titre])
+    largeur_img = int(colonnes * larg_car) + 2 * IMG_MARGE
+    hauteur_img = hauteur * (len(lignes) + 2) + 2 * IMG_MARGE
+
+    img = Image.new("RGB", (largeur_img, hauteur_img), IMG_FOND)
+    d = ImageDraw.Draw(img)
+    y = IMG_MARGE
+    d.text((IMG_MARGE, y), titre, font=gras, fill=IMG_TEXTE)
+    y += hauteur * 2
+
+    for i, ligne in enumerate(lignes):
+        if set(ligne.strip()) == {"-"}:                 # le filet de separation
+            milieu = y + hauteur // 2
+            d.line([(IMG_MARGE, milieu),
+                    (largeur_img - IMG_MARGE, milieu)], fill=IMG_LIGNE, width=2)
+        else:
+            nous_ici = ligne.startswith(">")
+            d.text((IMG_MARGE, y), ligne,
+                   font=gras if (i == 0 or nous_ici) else police,
+                   fill=IMG_ENTETE if i == 0 else
+                        (IMG_NOUS if nous_ici else IMG_TEXTE))
+        y += hauteur
+
+    from io import BytesIO
+    tampon = BytesIO()
+    img.save(tampon, format="PNG", optimize=True)
+    return tampon.getvalue()
 
 
 # --------------------------------------------------------------------------
@@ -466,7 +562,33 @@ def requete(url, data=None, methode="POST"):
         return json.loads(corps) if corps.strip() else {}
 
 
-def publier(contenu, cle_jour):
+def requete_fichier(url, payload, image, methode="POST"):
+    """Envoi multipart : Discord exige ce format des qu'un fichier accompagne
+    le message. Construit a la main pour rester sans dependance."""
+    limite = "----gdc{}".format(int(time.time() * 1000))
+    nl = b"\r\n"
+    corps = b""
+    corps += b"--" + limite.encode() + nl
+    corps += b'Content-Disposition: form-data; name="payload_json"' + nl
+    corps += b"Content-Type: application/json" + nl + nl
+    corps += json.dumps(payload).encode("utf-8") + nl
+    corps += b"--" + limite.encode() + nl
+    corps += (b'Content-Disposition: form-data; name="files[0]"; '
+              b'filename="' + NOM_IMAGE.encode() + b'"') + nl
+    corps += b"Content-Type: image/png" + nl + nl
+    corps += image + nl
+    corps += b"--" + limite.encode() + b"--" + nl
+
+    req = urllib.request.Request(url, data=corps, headers={
+        "Content-Type": "multipart/form-data; boundary=" + limite,
+        "User-Agent": "gdc-simulateur/1.0"}, method=methode)
+    with urllib.request.urlopen(req, timeout=60,
+                                context=ssl.create_default_context()) as r:
+        texte = r.read().decode("utf-8")
+        return json.loads(texte) if texte.strip() else {}
+
+
+def publier(contenu, cle_jour, image=None):
     """Cree le message au premier passage de la journee, le modifie ensuite."""
     url = webhook_url()
     payload = {"content": contenu, "username": NOM_BOT,
@@ -474,13 +596,25 @@ def publier(contenu, cle_jour):
     etat = charger_json(F_MESSAGE, {}) or {}
 
     if etat.get("jour") == cle_jour and etat.get("id"):
+        cible = "{}/messages/{}".format(url, etat["id"])
         try:
-            requete("{}/messages/{}".format(url, etat["id"]), payload, "PATCH")
+            if image:
+                # "attachments" vide = on retire l'ancienne image avant de
+                # joindre la nouvelle, sinon elles s'empilent.
+                p = dict(payload)
+                p["attachments"] = [{"id": 0, "filename": NOM_IMAGE}]
+                requete_fichier(cible, p, image, "PATCH")
+            else:
+                requete(cible, payload, "PATCH")
             return "modifie"
         except urllib.error.HTTPError as e:
             if e.code != 404:               # 404 = message supprime a la main
                 raise
-    rep = requete(url + "?wait=true", payload, "POST")
+
+    if image:
+        rep = requete_fichier(url + "?wait=true", payload, image, "POST")
+    else:
+        rep = requete(url + "?wait=true", payload, "POST")
     if rep.get("id"):
         sauver_json(F_MESSAGE, {"jour": cle_jour, "id": rep["id"]})
     return "cree"
@@ -508,17 +642,24 @@ def un_passage(args):
         return False
 
     clans = [projeter(c) for c in bruts]
-    message = construire_message(data, clans, large=args.large)
+    message, image = construire_message(data, clans, large=args.large,
+                                        sans_image=args.sans_image)
 
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
     print("\n" + message.replace("```", "").replace("**", "").replace("-# ", ""))
+    if image:
+        print("\n[tableau joint en image : {} Ko]".format(len(image) // 1024))
+        for l in tableau_large(clans, next(
+                (c for c in clans
+                 if c["tag"].lstrip("#") == CLAN_TAG.lstrip("#").upper()), None)):
+            print("  " + l)
 
     if not args.sans_discord:
         jour = "{}-{}".format(data.get("sectionIndex"), data.get("periodIndex"))
-        action = publier(message, jour)
+        action = publier(message, jour, image)
         print("\nDiscord : message {}.".format(action))
     return True
 
@@ -550,7 +691,9 @@ def main():
     ap.add_argument("--une-fois", action="store_true", help="un seul calcul")
     ap.add_argument("--sans-discord", action="store_true", help="console uniquement")
     ap.add_argument("--large", action="store_true",
-                    help="tableau en colonnes (grand ecran) au lieu des fiches")
+                    help="tableau en colonnes en texte au lieu de l'image")
+    ap.add_argument("--sans-image", action="store_true",
+                    help="ne pas generer le PNG (repli en texte)")
     ap.add_argument("--intervalle", type=int,
                     help="forcer un intervalle fixe, en minutes")
     ap.add_argument("--heures", type=float,
