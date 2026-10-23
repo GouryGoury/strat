@@ -53,6 +53,8 @@ AVATAR_URL = ""              # optionnel : URL d'une image pour l'avatar du bot
 DOSSIER   = os.path.dirname(os.path.abspath(__file__))
 F_TOKEN   = os.path.join(DOSSIER, "cr_token.txt")
 F_WEBHOOK = os.path.join(DOSSIER, "discord_webhook.txt")
+# Facultatif : un salon dedie au classement de saison
+F_WEBHOOK_CLASSEMENT = os.path.join(DOSSIER, "discord_webhook_classement.txt")
 F_PUBLIE  = os.path.join(DOSSIER, "deja_publie.json")
 F_JOURNAL = os.path.join(DOSSIER, "journal.log")
 
@@ -366,7 +368,11 @@ def sections(saison, semaines_sais, stats, perfs):
 # --------------------------------------------------------------------------
 
 def webhook_url():
-    u = os.environ.get("DISCORD_WEBHOOK") or lire_fichier(F_WEBHOOK)
+    # Salon dedie au classement s'il existe, sinon le salon principal.
+    u = (os.environ.get("DISCORD_WEBHOOK_CLASSEMENT")
+         or lire_fichier(F_WEBHOOK_CLASSEMENT)
+         or os.environ.get("DISCORD_WEBHOOK")
+         or lire_fichier(F_WEBHOOK))
     if not u:
         sys.exit("Webhook Discord introuvable : colle l'URL dans discord_webhook.txt")
     if not u.startswith("https://discord.com/api/webhooks/"):
