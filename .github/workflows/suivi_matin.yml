@@ -48,7 +48,8 @@ jobs:
           date -u +"Derniere execution : %Y-%m-%d %H:%M UTC" > derniere_execution.txt
           git config user.name "github-actions"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add derniere_execution.txt message_simulateur.json || true
+          git add derniere_execution.txt message_simulateur.json \
+                  message_relance.json journal_projections || true
           git commit -m "suivi matin $(date -u +%F)" || exit 0
           git pull --rebase --autostash || true
           git push
