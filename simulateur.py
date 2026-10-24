@@ -52,6 +52,19 @@ PTS_BATEAU_GAGNE  = 125      # attaque de bateau reussie, 1 deck
 PTS_BATEAU_PERDU  = 75       # attaque de bateau ratee, 1 deck
 DECKS_PAR_JOUEUR  = 4        # decks disponibles par joueur et par jour
 MEMBRES_PAR_CLAN  = 50        # effectif maximum d'un clan : 50 x 4 = 200 decks/jour
+DECKS_PAR_SEMAINE = 16        # 4 jours de guerre x 4 decks
+
+# --- fiabilite des joueurs -------------------------------------------------
+SEMAINES_FIABILITE = 10       # profondeur de l'historique (maximum de l'API)
+MIN_SEMAINES_FIAB  = 3        # en dessous, le taux n'est pas significatif
+FIABILITE_DEFAUT   = 0.75     # joueur sans historique exploitable
+HEURES_INACTIF     = 6        # au-dela, un joueur en attente devient douteux
+RELANCE_MAX        = 20       # lignes affichees dans la liste de relance
+
+# Analyse fine des adversaires (journal de combats) : couteuse en appels, donc
+# reservee a la fin de journee et aux clans ou il ne manque plus grand monde.
+ADVERSAIRES_DERNIERE_MIN = 60
+ADVERSAIRES_MAX_ATTENTE  = 10
                               # ATTENTION : la liste "participants" renvoyee par
                               # l'API contient TOUS ceux qui ont joue dans la
                               # SEMAINE, anciens membres compris (souvent 70-95
@@ -62,15 +75,17 @@ MEMBRES_PAR_CLAN  = 50        # effectif maximum d'un clan : 50 x 4 = 200 decks/
 # (minutes restantes au plus, intervalle en minutes)
 # Les paliers suivent donc l'heure de fin reelle, y compris au changement
 # d'heure. Avec une bascule a 12h00, cela donne :
-#   6h00 -> 9h00  toutes les heures
+#   6h00 -> 9h00  toutes les 30 min
 #   9h00 -> 10h00 toutes les 20 min
 #   10h00 -> 10h30 toutes les 10 min
-#   10h30 -> 12h00 toutes les 5 min
+#   10h30 -> 11h00 toutes les 5 min
+#   11h00 -> 12h00 toutes les 2 min
 PALIERS = [
-    (90,  5),      # derniere heure et demie
+    (60,   2),     # derniere heure
+    (90,   5),     # de -1h30 a -1h
     (120, 10),     # de -2h a -1h30
     (180, 20),     # de -3h a -2h
-    (360, 60),     # de -6h a -3h
+    (360, 30),     # de -6h a -3h
 ]
 HORS_FENETRE_MIN  = 360      # debut de la fenetre de suivi, en minutes avant la fin
 TOLERANCE_MIN     = 20       # marge de demarrage anticipe acceptee
@@ -106,8 +121,37 @@ DOSSIER   = os.path.dirname(os.path.abspath(__file__))
 F_TOKEN   = os.path.join(DOSSIER, "cr_token.txt")
 F_WEBHOOK = os.path.join(DOSSIER, "discord_webhook.txt")
 F_MESSAGE = os.path.join(DOSSIER, "message_simulateur.json")
+F_RELANCE = os.path.join(DOSSIER, "message_relance.json")
+# Salon ou paraissent les joueurs a relancer (a defaut : salon du classement,
+# puis salon principal)
+F_WEBHOOK_RELANCE = os.path.join(DOSSIER, "discord_webhook_relance.txt")
+F_WEBHOOK_CLASSEMENT = os.path.join(DOSSIER, "discord_webhook_classement.txt")
 
 # ==========================================================================
+
+
+def _dernier_dimanche(annee, mois):
+    """Dernier dimanche du mois, a 01h00 UTC : bascule horaire europeenne."""
+    jour = datetime(annee, mois, 31, 1, 0, tzinfo=timezone.utc)
+    while jour.weekday() != 6:
+        jour -= timedelta(days=1)
+    return jour
+
+
+def heure_fr(quand=None):
+    """Convertit en heure francaise. Sur GitHub la machine est en UTC : sans
+    cela, toutes les heures affichees seraient decalees d'une ou deux heures.
+    On utilise la base de fuseaux si elle est installee, sinon on applique la
+    regle europeenne (dernier dimanche de mars au dernier dimanche d'octobre)."""
+    q = quand or datetime.now(timezone.utc)
+    if q.tzinfo is None:
+        q = q.replace(tzinfo=timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        return q.astimezone(ZoneInfo("Europe/Paris"))
+    except Exception:
+        ete = _dernier_dimanche(q.year, 3) <= q < _dernier_dimanche(q.year, 10)
+        return q + timedelta(hours=2 if ete else 1)
 
 
 def lire_fichier(chemin):
@@ -160,11 +204,15 @@ def cadrer(texte, colonnes):
 # API
 # --------------------------------------------------------------------------
 
-def api(chemin):
+def tag_url(tag):
+    return urllib.parse.quote("#" + tag.strip().lstrip("#").upper(), safe="")
+
+
+def api(chemin, params="", tolerant=False):
     token = os.environ.get("CR_API_TOKEN") or lire_fichier(F_TOKEN)
     if not token:
         sys.exit("Cle API introuvable : cr_token.txt doit etre a cote du script.")
-    req = urllib.request.Request(BASE_URL + chemin, headers={
+    req = urllib.request.Request(BASE_URL + chemin + params, headers={
         "Authorization": "Bearer " + token,
         "Accept": "application/json",
         "User-Agent": "gdc-simulateur/1.0",
@@ -177,15 +225,137 @@ def api(chemin):
                 return json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             corps = e.read().decode("utf-8", "replace")[:200]
-            if e.code == 403:
+            if e.code == 403 and not tolerant:
                 sys.exit("Erreur 403 : la cle doit etre creee avec l'IP "
                          "45.79.218.79 (proxy RoyaleAPI).\n" + corps)
+            if tolerant:
+                return None
             derniere = "HTTP {} : {}".format(e.code, corps)
         except Exception as e:
             derniere = str(e)
         time.sleep(3 * (essai + 1))
-    print("Appel API impossible : {}".format(derniere))
+    print("Appel API impossible ({}) : {}".format(chemin, derniere))
     return None
+
+
+# --------------------------------------------------------------------------
+# Fiabilite des joueurs
+# --------------------------------------------------------------------------
+# L'API officielle n'expose aucun historique de guerre sur la fiche d'un
+# joueur. On le reconstitue a partir de l'historique du CLAN, interrogeable
+# pour n'importe quel clan : 10 semaines, et seulement tant que le joueur y
+# etait. Un nouvel arrivant n'a donc pas de taux.
+
+_cache_histo = {}      # tag clan   -> {tag joueur: {nom, decks, semaines}}
+_cache_membres = {}    # tag clan   -> [{tag, name, role}]
+_cache_combat = {}     # tag joueur -> {"decks": n, "dernier": datetime|None}
+
+
+def historique_clan(tag_clan):
+    """Decks joues par chaque joueur sur les dernieres semaines archivees."""
+    cle = tag_clan.lstrip("#").upper()
+    if cle in _cache_histo:
+        return _cache_histo[cle]
+    data = api("/clans/{}/riverracelog".format(tag_url(cle)),
+               "?limit={}".format(SEMAINES_FIABILITE), tolerant=True) or {}
+    histo = {}
+    for e in data.get("items", []):
+        for st in e.get("standings", []):
+            c = st.get("clan") or {}
+            if c.get("tag", "").lstrip("#").upper() != cle:
+                continue
+            for p in c.get("participants", []):
+                h = histo.setdefault(p["tag"], {"nom": p.get("name", "?"),
+                                                "decks": 0, "semaines": 0})
+                h["nom"] = p.get("name", h["nom"])
+                h["decks"] += p.get("decksUsed", 0) or 0
+                h["semaines"] += 1
+    _cache_histo[cle] = histo
+    return histo
+
+
+def fiabilite(tag_joueur, histo):
+    """Part des combats hebdomadaires reellement joues, sur 0 a 1.
+    None quand l'historique est trop court pour conclure."""
+    h = histo.get(tag_joueur)
+    if not h or h["semaines"] < MIN_SEMAINES_FIAB:
+        return None
+    return min(1.0, h["decks"] / float(h["semaines"] * DECKS_PAR_SEMAINE))
+
+
+def membres_clan(tag_clan):
+    cle = tag_clan.lstrip("#").upper()
+    if cle not in _cache_membres:
+        d = api("/clans/{}/members".format(tag_url(cle)), tolerant=True) or {}
+        _cache_membres[cle] = d.get("items", [])
+    return _cache_membres[cle]
+
+
+def dernier_combat(tag_joueur, decks_du_jour):
+    """Heure du dernier combat de guerre du joueur.
+
+    Le resultat est memorise : tant que son nombre de decks du jour n'a pas
+    bouge, il n'a pas joue, donc l'heure est inchangee et on evite un appel.
+    C'est ce qui rend l'analyse des adversaires abordable."""
+    memo = _cache_combat.get(tag_joueur)
+    if memo is not None and memo["decks"] == decks_du_jour:
+        return memo["dernier"]
+    journal = api("/players/{}/battlelog".format(tag_url(tag_joueur)),
+                  tolerant=True) or []
+    dernier = None
+    for b in journal:
+        genre = (b.get("type") or "").lower()
+        if "riverrace" not in genre and "boat" not in genre:
+            continue
+        try:
+            q = datetime.strptime(b.get("battleTime", ""), "%Y%m%dT%H%M%S.%fZ")
+            q = q.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if dernier is None or q > dernier:
+            dernier = q
+    _cache_combat[tag_joueur] = {"decks": decks_du_jour, "dernier": dernier}
+    return dernier
+
+
+def joueurs_en_attente(clan_brut, tag_clan, avec_horaires=False):
+    """Membres actuels ayant encore des decks a jouer aujourd'hui."""
+    histo = historique_clan(tag_clan)
+    membres = membres_clan(tag_clan)
+    joues = {p["tag"]: (p.get("decksUsedToday") or 0)
+             for p in clan_brut.get("participants", [])}
+    noms = {p["tag"]: p.get("name", "?")
+            for p in clan_brut.get("participants", [])}
+    out = []
+    for m in membres:
+        t = m.get("tag")
+        if not t:
+            continue
+        utilises = joues.get(t, 0)
+        restants = DECKS_PAR_JOUEUR - utilises
+        if restants <= 0:
+            continue
+        out.append({
+            "tag": t,
+            "nom": m.get("name") or noms.get(t, "?"),
+            "utilises": utilises,
+            "restants": restants,
+            "entame": utilises > 0,
+            "fiab": fiabilite(t, histo),
+            "dernier": dernier_combat(t, utilises) if avec_horaires else None,
+        })
+    return out
+
+
+def heures_depuis(quand):
+    if quand is None:
+        return None
+    return (datetime.now(timezone.utc) - quand).total_seconds() / 3600.0
+
+
+def poids(j):
+    """Probabilite retenue qu'un deck en attente soit effectivement joue."""
+    return j["fiab"] if j["fiab"] is not None else FIABILITE_DEFAUT
 
 
 # --------------------------------------------------------------------------
@@ -265,6 +435,33 @@ def projeter(clan):
         "moyenne": score + decks_restants * moyenne_deck,
         "plafond": score + plafond_sup,
     }
+
+
+def enrichir(projection, clan_brut, avec_horaires=False):
+    """Ajoute a une projection le detail par joueur et la colonne ATTENDU.
+
+    ATTENDU = score actuel + somme, pour chaque deck encore a jouer, de sa
+    probabilite d'etre joue (la fiabilite de son detenteur) multipliee par le
+    rendement moyen du clan aujourd'hui. C'est la projection la plus proche
+    du reel : ni le pessimisme du plancher, ni l'optimisme du moyen qui
+    suppose que tout le monde joue."""
+    joueurs = joueurs_en_attente(clan_brut, projection["tag"], avec_horaires)
+    projection["joueurs"] = joueurs
+
+    connus = [j["fiab"] for j in joueurs if j["fiab"] is not None]
+    moyenne_clan = sum(connus) / len(connus) if connus else FIABILITE_DEFAUT
+    projection["fiab_clan"] = moyenne_clan
+
+    decks_identifies = sum(j["restants"] for j in joueurs)
+    esperes = sum(j["restants"] * poids(j) for j in joueurs)
+    # Les places vides du clan sont comptees comme 200 decks au total : on
+    # applique a ce reliquat anonyme la fiabilite moyenne du clan.
+    anonymes = max(0, projection["decks_restants"] - decks_identifies)
+    esperes += anonymes * moyenne_clan
+
+    projection["decks_attendus"] = esperes
+    projection["attendu"] = projection["score"] + esperes * projection["moyenne_deck"]
+    return projection
 
 
 def budget_bateaux(nous, cible, victoires=0):
@@ -400,23 +597,35 @@ def tableau_large(clans, nous):
     """Tableau en colonnes : lisible sur PC, illisible sur telephone."""
     # +1 pour le marqueur ">" : sans cela le nom du clan serait tronque
     lp = max([largeur(c["nom"]) for c in clans] + [12]) + 1
-    gabarit = "{} {:>7} {:>6} {:>6} {:>7} {:>8} {:>8} {:>8}"
-    lignes = [gabarit.format(cadrer("CLAN", lp), "SCORE", "JOUES", "DISPO",
-                             "ENTAMES", "PLANCHER", "MOYEN", "PLAFOND")]
+    avec_fiab = any("attendu" in c for c in clans)
+    if avec_fiab:
+        gabarit = "{} {:>7} {:>6} {:>6} {:>7} {:>5} {:>8} {:>8} {:>8} {:>8}"
+        lignes = [gabarit.format(cadrer("CLAN", lp), "SCORE", "JOUES", "DISPO",
+                                 "ENTAMES", "FIAB", "PLANCHER", "ATTENDU",
+                                 "MOYEN", "PLAFOND")]
+    else:
+        gabarit = "{} {:>7} {:>6} {:>6} {:>7} {:>8} {:>8} {:>8}"
+        lignes = [gabarit.format(cadrer("CLAN", lp), "SCORE", "JOUES", "DISPO",
+                                 "ENTAMES", "PLANCHER", "MOYEN", "PLAFOND")]
     lignes.append("-" * largeur(lignes[0]))
     for c in sorted(clans, key=lambda x: -x["score"]):
         marque = ">" if c is nous else " "
-        lignes.append(gabarit.format(
-            marque + cadrer(c["nom"], lp - 1), fmt(c["score"]),
-            c["decks_faits"], c["decks_dispo"], c["decks_entames"],
-            fmt(c["plancher"]), fmt(c["moyenne"]), fmt(c["plafond"])))
+        base = [marque + cadrer(c["nom"], lp - 1), fmt(c["score"]),
+                c["decks_faits"], c["decks_dispo"], c["decks_entames"]]
+        if avec_fiab:
+            base.append("{:.0f}%".format(c.get("fiab_clan", 0) * 100))
+            base += [fmt(c["plancher"]), fmt(c.get("attendu", c["moyenne"])),
+                     fmt(c["moyenne"]), fmt(c["plafond"])]
+        else:
+            base += [fmt(c["plancher"]), fmt(c["moyenne"]), fmt(c["plafond"])]
+        lignes.append(gabarit.format(*base))
     return lignes
 
 
 def tableau_mobile(clans, nous):
     """Une fiche de 3 lignes par clan, chacune sous les ~33 caracteres que
     Discord affiche sur telephone avant de renvoyer a la ligne."""
-    lignes = ["      plancher < moyen < plafond"]
+    lignes = ["    plancher < attendu < plafond"]
     for rang, c in enumerate(sorted(clans, key=lambda x: -x["score"]), 1):
         marque = ">" if c is nous else " "
         lignes.append("")
@@ -424,8 +633,9 @@ def tableau_mobile(clans, nous):
             rang, marque, cadrer(c["nom"], 19), fmt(c["score"]).rjust(7)))
         lignes.append("   {:>3} joues {:>4} dispo {:>3} ent".format(
             c["decks_faits"], c["decks_dispo"], c["decks_entames"]))
+        milieu = c.get("attendu", c["moyenne"])
         lignes.append("   {} < {} < {}".format(
-            fmt(c["plancher"]).rjust(6), fmt(c["moyenne"]).rjust(6),
+            fmt(c["plancher"]).rjust(6), fmt(milieu).rjust(6),
             fmt(c["plafond"]).rjust(6)))
     return lignes
 
@@ -436,14 +646,19 @@ def construire_message(data, clans, large=False, sans_image=False):
     adversaires = [c for c in clans if c is not nous]
 
     semaine = (data.get("sectionIndex", 0) or 0) + 1
-    corps = "**GUERRE DE CLAN - JOURNEE EN COURS**\n(semaine {}, fin dans {})".format(
-        semaine, duree_lisible(temps_restant()))
+    fin_locale = heure_fr(datetime.now(timezone.utc) + temps_restant())
+    corps = "**GUERRE DE CLAN - JOURNEE EN COURS**\n(semaine {}, fin dans {} " \
+            "- a {})".format(semaine, duree_lisible(temps_restant()),
+                             fin_locale.strftime("%Hh%M"))
 
     mode = "large" if large else AFFICHAGE
     image = None
     if mode == "image" and not sans_image:
-        image = generer_image(clans, nous, "Semaine {} - fin dans {}".format(
-            semaine, duree_lisible(temps_restant())))
+        image = generer_image(
+            tableau_large(clans, nous),
+            "Semaine {} - fin dans {} ({})".format(
+                semaine, duree_lisible(temps_restant()),
+                fin_locale.strftime("%Hh%M")))
         if image is None:               # Pillow absent : repli silencieux
             mode = "mobile"
     if image is None:
@@ -457,14 +672,69 @@ def construire_message(data, clans, large=False, sans_image=False):
         # le plan reste en texte normal : il se replie proprement sur mobile,
         # contrairement a un bloc de code
         corps += "\n" + "\n".join(lignes_plan(nous, plan))
+        fines = [c for c in clans if c.get("fine") and c.get("joueurs")]
+        for c in fines:
+            inactifs = sum(1 for j in c["joueurs"]
+                           if (heures_depuis(j["dernier"]) or 0) >= HEURES_INACTIF)
+            corps += "\n-# {} : {} joueur(s) en attente, dont {} sans combat " \
+                     "depuis plus de {} h.".format(
+                         c["nom"], len(c["joueurs"]), inactifs, HEURES_INACTIF)
         if not all(c["detaille"] for c in clans):
             corps += "\n-# Projections approchees pour les clans sans detail " \
                      "par joueur."
     corps += "\n-# PLANCHER = tout est perdu et les decks entames ne sont jamais " \
              "termines. MOYEN et PLAFOND supposent tous les decks joues."
-    corps += "\n-# Mis a jour a {} - prochaine actualisation dans {} min".format(
-        datetime.now().strftime("%H:%M"), intervalle_courant())
+    iv = intervalle_courant()
+    maintenant = heure_fr()
+    suivante = maintenant + timedelta(minutes=iv)
+    corps += "\n-# Mis a jour a {} - prochaine actualisation dans {} min, " \
+             "a {}".format(maintenant.strftime("%Hh%M"), iv,
+                           suivante.strftime("%Hh%M"))
     return corps, image
+
+
+def duree_courte(heures):
+    if heures is None:
+        return "?"
+    if heures < 1:
+        return "{} min".format(int(heures * 60))
+    if heures < 24:
+        return "{}h{:02d}".format(int(heures), int((heures % 1) * 60))
+    return "{} j".format(int(heures / 24))
+
+
+def tableau_relance(nous, avec_horaires):
+    """Qui relancer, du plus inquietant au moins inquietant."""
+    joueurs = sorted(nous.get("joueurs", []),
+                     key=lambda j: (-(j["restants"] * (1 - poids(j))),
+                                    j["nom"].lower()))
+    if not joueurs:
+        return ["Tous les membres ont joue leurs combats."]
+
+    visibles = joueurs[:RELANCE_MAX]
+    lp = min(16, max([largeur(j["nom"]) for j in visibles] + [8]))
+    entete = "{} {:>7} {:>8} {:>5}".format(cadrer("JOUEUR", lp), "COMBATS",
+                                           "RESTANTS", "FIAB")
+    if avec_horaires:
+        entete += " {:>12}".format("DERNIER JEU")
+    lignes = [entete, "-" * largeur(entete)]
+    for j in visibles:
+        ligne = "{} {:>7} {:>8} {:>5}".format(
+            cadrer(j["nom"], lp), "{}/{}".format(j["utilises"], DECKS_PAR_JOUEUR),
+            j["restants"],
+            "{:.0f}%".format(j["fiab"] * 100) if j["fiab"] is not None else "n.c.")
+        if avec_horaires:
+            ligne += " {:>12}".format(duree_courte(heures_depuis(j["dernier"])))
+        lignes.append(ligne)
+
+    reste = len(joueurs) - len(visibles)
+    if reste:
+        lignes.append("... et {} autre(s) joueur(s), moins a risque".format(reste))
+    total = sum(j["restants"] for j in joueurs)
+    lignes.append("-" * largeur(entete))
+    lignes.append("{} joueurs, {} combats en attente, {:.0f} attendus".format(
+        len(joueurs), total, nous.get("decks_attendus", 0)))
+    return lignes
 
 
 # --------------------------------------------------------------------------
@@ -494,15 +764,13 @@ def _police(taille, gras=False):
         return ImageFont.load_default()
 
 
-def generer_image(clans, nous, titre):
-    """Rend le tableau large en PNG. Renvoie des octets, ou None si Pillow
-    n'est pas installe."""
+def generer_image(lignes, titre):
+    """Rend un tableau en PNG. Renvoie des octets, ou None si Pillow manque."""
     try:
         from PIL import Image, ImageDraw
     except ImportError:
         return None
 
-    lignes = tableau_large(clans, nous)
     police = _police(IMG_TAILLE)
     gras = _police(IMG_TAILLE, gras=True)
 
@@ -551,6 +819,18 @@ def webhook_url():
     return u
 
 
+def webhook_relance():
+    """Salon des joueurs a relancer : son propre webhook s'il existe, sinon
+    celui du classement, sinon le salon principal."""
+    for source in (os.environ.get("DISCORD_WEBHOOK_RELANCE"),
+                   lire_fichier(F_WEBHOOK_RELANCE),
+                   os.environ.get("DISCORD_WEBHOOK_CLASSEMENT"),
+                   lire_fichier(F_WEBHOOK_CLASSEMENT)):
+        if source and source.startswith("https://discord.com/api/webhooks/"):
+            return source
+    return webhook_url()
+
+
 def requete(url, data=None, methode="POST"):
     req = urllib.request.Request(
         url, data=(json.dumps(data).encode("utf-8") if data is not None else None),
@@ -582,18 +862,42 @@ def requete_fichier(url, payload, image, methode="POST"):
     req = urllib.request.Request(url, data=corps, headers={
         "Content-Type": "multipart/form-data; boundary=" + limite,
         "User-Agent": "gdc-simulateur/1.0"}, method=methode)
-    with urllib.request.urlopen(req, timeout=60,
-                                context=ssl.create_default_context()) as r:
-        texte = r.read().decode("utf-8")
-        return json.loads(texte) if texte.strip() else {}
+    try:
+        with urllib.request.urlopen(req, timeout=60,
+                                    context=ssl.create_default_context()) as r:
+            texte = r.read().decode("utf-8")
+            return json.loads(texte) if texte.strip() else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:400]
+        raise RuntimeError("Discord a refuse l'envoi multipart "
+                           "(HTTP {}) : {}".format(e.code, detail))
 
 
-def publier(contenu, cle_jour, image=None):
-    """Cree le message au premier passage de la journee, le modifie ensuite."""
-    url = webhook_url()
+def publier(contenu, cle_jour, image=None, clans=None, nous=None,
+            url=None, fichier_etat=None):
+    """Cree le message au premier passage de la journee, le modifie ensuite.
+
+    Si l'envoi de l'image echoue (format multipart refuse, image trop lourde,
+    incident Discord), on repart sans image avec le tableau en texte plutot
+    que de laisser tomber la publication."""
+    url = url or webhook_url()
+    fichier_etat = fichier_etat or F_MESSAGE
+    try:
+        return _publier(contenu, cle_jour, image, url, fichier_etat)
+    except Exception as e:
+        if image is None:
+            raise
+        print("Envoi avec image impossible ({}) : repli en texte.".format(e))
+        secours = contenu
+        if clans:
+            secours += "\n```\n" + "\n".join(tableau_mobile(clans, nous)) + "\n```"
+        return _publier(secours, cle_jour, None, url, fichier_etat) + " (sans image)"
+
+
+def _publier(contenu, cle_jour, image, url, fichier_etat):
     payload = {"content": contenu, "username": NOM_BOT,
                "allowed_mentions": {"parse": []}}
-    etat = charger_json(F_MESSAGE, {}) or {}
+    etat = charger_json(fichier_etat, {}) or {}
 
     if etat.get("jour") == cle_jour and etat.get("id"):
         cible = "{}/messages/{}".format(url, etat["id"])
@@ -616,11 +920,16 @@ def publier(contenu, cle_jour, image=None):
     else:
         rep = requete(url + "?wait=true", payload, "POST")
     if rep.get("id"):
-        sauver_json(F_MESSAGE, {"jour": cle_jour, "id": rep["id"]})
+        sauver_json(fichier_etat, {"jour": cle_jour, "id": rep["id"]})
     return "cree"
 
 
 # --------------------------------------------------------------------------
+
+def fin_locale_str(data):
+    return heure_fr(datetime.now(timezone.utc)
+                    + temps_restant()).strftime("%Hh%M")
+
 
 def un_passage(args):
     if args.json:
@@ -628,8 +937,7 @@ def un_passage(args):
         if data is None:
             sys.exit("Fichier {} illisible.".format(args.json))
     else:
-        data = api("/clans/{}/currentriverrace".format(
-            urllib.parse.quote("#" + CLAN_TAG.lstrip("#").upper(), safe="")))
+        data = api("/clans/{}/currentriverrace".format(tag_url(CLAN_TAG)))
         if data is None:
             return False
 
@@ -641,7 +949,29 @@ def un_passage(args):
               "en cours.")
         return False
 
-    clans = [projeter(c) for c in bruts]
+    cible = CLAN_TAG.lstrip("#").upper()
+    clans, bruts_par_tag = [], {}
+    for brut in bruts:
+        p = projeter(brut)
+        bruts_par_tag[p["tag"].lstrip("#")] = brut
+        clans.append(p)
+    nous = next((c for c in clans if c["tag"].lstrip("#") == cible), None)
+
+    if not args.sans_fiabilite:
+        for c in clans:
+            # horaires systematiques pour nous : c'est la liste de relance
+            enrichir(c, bruts_par_tag[c["tag"].lstrip("#")],
+                     avec_horaires=(c is nous))
+        # Analyse fine des adversaires : seulement en fin de journee et
+        # seulement la ou il ne reste plus grand monde, pour limiter les appels.
+        if temps_restant().total_seconds() / 60 <= ADVERSAIRES_DERNIERE_MIN:
+            for c in clans:
+                if c is nous or len(c.get("joueurs", [])) >= ADVERSAIRES_MAX_ATTENTE:
+                    continue
+                for j in c["joueurs"]:
+                    j["dernier"] = dernier_combat(j["tag"], j["utilises"])
+                c["fine"] = True
+
     message, image = construire_message(data, clans, large=args.large,
                                         sans_image=args.sans_image)
 
@@ -657,10 +987,28 @@ def un_passage(args):
                  if c["tag"].lstrip("#") == CLAN_TAG.lstrip("#").upper()), None)):
             print("  " + l)
 
+    jour = "{}-{}".format(data.get("sectionIndex"), data.get("periodIndex"))
+
+    # --- second message : qui relancer chez nous ---------------------------
+    texte_relance, image_relance = None, None
+    if nous is not None and not args.sans_fiabilite:
+        lignes = tableau_relance(nous, avec_horaires=True)
+        texte_relance = "**COMBATS EN ATTENTE - {}**\n-# Fin de journee a {}".format(
+            heure_fr().strftime("%Hh%M"), fin_locale_str(data))
+        if not args.sans_image:
+            image_relance = generer_image(lignes, "Combats en attente - {}".format(
+                heure_fr().strftime("%Hh%M")))
+        if image_relance is None:
+            texte_relance += "\n```\n" + "\n".join(lignes) + "\n```"
+        print("\n" + "\n".join(lignes))
+
     if not args.sans_discord:
-        jour = "{}-{}".format(data.get("sectionIndex"), data.get("periodIndex"))
-        action = publier(message, jour, image)
-        print("\nDiscord : message {}.".format(action))
+        action = publier(message, jour, image, clans, nous)
+        print("\nDiscord (strategie) : message {}.".format(action))
+        if texte_relance:
+            action = publier(texte_relance, jour, image_relance,
+                             url=webhook_relance(), fichier_etat=F_RELANCE)
+            print("Discord (relance)   : message {}.".format(action))
     return True
 
 
@@ -675,8 +1023,8 @@ def calibrer(compte_a_rebours):
         sys.exit("Format attendu : --calibrer 20:26")
     fin = datetime.now(timezone.utc) + reste
     print("Fin de journee calculee : {:02d}:{:02d} UTC "
-          "(soit {} heure locale).".format(
-              fin.hour, fin.minute, fin.astimezone().strftime("%Hh%M")))
+          "(soit {} heure francaise).".format(
+              fin.hour, fin.minute, heure_fr(fin).strftime("%Hh%M")))
     print("\nRemplace ces deux lignes en haut de simulateur.py :")
     print("    HEURE_RESET_UTC   = {}".format(fin.hour))
     print("    MINUTE_RESET_UTC  = {}".format(fin.minute))
@@ -692,6 +1040,10 @@ def main():
     ap.add_argument("--sans-discord", action="store_true", help="console uniquement")
     ap.add_argument("--large", action="store_true",
                     help="tableau en colonnes en texte au lieu de l'image")
+    ap.add_argument("--test-discord", action="store_true",
+                    help="envoyer un message de test avec l'image, pour verifier")
+    ap.add_argument("--sans-fiabilite", action="store_true",
+                    help="ne pas calculer la fiabilite ni la liste de relance")
     ap.add_argument("--sans-image", action="store_true",
                     help="ne pas generer le PNG (repli en texte)")
     ap.add_argument("--intervalle", type=int,
@@ -703,6 +1055,28 @@ def main():
                          "(pour decouper le suivi en plusieurs taches)")
     ap.add_argument("--json", help="fichier currentriverrace local (hors ligne)")
     args = ap.parse_args()
+
+    if args.test_discord:
+        from datetime import datetime as _dt
+        faux = [{"nom": "Clan de test", "tag": CLAN_TAG, "score": 1234,
+                 "decks_faits": 40, "decks_dispo": 150, "decks_entames": 10,
+                 "moyenne_deck": 180.0, "detaille": True, "plancher": 16234,
+                 "moyenne": 30034, "plafond": 37234}]
+        img = generer_image(tableau_large(faux, faux[0]), "Test d'envoi")
+        print("Pillow :", "disponible" if img else "ABSENT (envoi en texte)")
+        texte = "Test du simulateur, envoye a {}.".format(
+            _dt.now().strftime("%H:%M:%S"))
+        try:
+            rep = (requete_fichier(webhook_url() + "?wait=true",
+                                   {"content": texte, "username": NOM_BOT},
+                                   img, "POST") if img
+                   else requete(webhook_url() + "?wait=true",
+                                {"content": texte, "username": NOM_BOT}, "POST"))
+            print("Envoi reussi. Identifiant du message :", rep.get("id"))
+        except Exception as e:
+            print("ECHEC :", e)
+            sys.exit(1)
+        return
 
     if args.calibrer:
         calibrer(args.calibrer)
@@ -738,8 +1112,17 @@ def main():
         return
 
     try:
+        echecs = 0
         while temps_restant().total_seconds() > max(60, arret):
-            un_passage(args)
+            try:
+                un_passage(args)
+                echecs = 0
+            except Exception as e:
+                echecs += 1
+                print("Passage en echec ({}/5) : {}".format(echecs, e))
+                if echecs >= 5:
+                    print("Cinq echecs d'affilee : arret.")
+                    raise
             if temps_restant().total_seconds() <= max(60, arret):
                 break
             time.sleep(attente_prochaine(args.intervalle))
