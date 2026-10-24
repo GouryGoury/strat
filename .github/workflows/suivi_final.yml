@@ -35,12 +35,23 @@ jobs:
           DISCORD_WEBHOOK_CLASSEMENT: ${{ secrets.DISCORD_WEBHOOK_CLASSEMENT }}
         run: python simulateur.py
 
+      # La boucle vient de s'arreter a la bascule : le dernier releve fait
+      # office de score final, on peut confronter nos projections au reel.
+      - name: Bilan de fiabilite des projections
+        if: always()
+        env:
+          CR_API_TOKEN: ${{ secrets.CR_API_TOKEN }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DISCORD_WEBHOOK_BILAN: ${{ secrets.DISCORD_WEBHOOK_BILAN }}
+        run: python bilan.py
+
       - name: Memoriser le message
         if: always()
         run: |
           git config user.name "github-actions"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add message_simulateur.json || true
+          git add message_simulateur.json message_relance.json \
+                  journal_projections || true
           git commit -m "suivi final $(date -u +%F)" || exit 0
           git pull --rebase --autostash || true
           git push
