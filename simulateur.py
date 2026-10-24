@@ -843,22 +843,32 @@ def webhook_relance():
     return webhook_url()
 
 
+class ErreurDiscord(Exception):
+    """Refus de Discord, avec son code HTTP : indispensable pour distinguer
+    un message disparu (404, on en recree un) d'une vraie panne."""
+
+    def __init__(self, code, detail=""):
+        Exception.__init__(self, "HTTP {} : {}".format(code, detail))
+        self.code = code
+
+
 def requete(url, data=None, methode="POST"):
     req = urllib.request.Request(
         url, data=(json.dumps(data).encode("utf-8") if data is not None else None),
         headers={"Content-Type": "application/json",
                  "User-Agent": "gdc-simulateur/1.0"}, method=methode)
-    with urllib.request.urlopen(req, timeout=30,
-                                context=ssl.create_default_context()) as r:
-        corps = r.read().decode("utf-8")
-        return json.loads(corps) if corps.strip() else {}
+    try:
+        with urllib.request.urlopen(req, timeout=30,
+                                    context=ssl.create_default_context()) as r:
+            corps = r.read().decode("utf-8")
+            return json.loads(corps) if corps.strip() else {}
+    except urllib.error.HTTPError as e:
+        raise ErreurDiscord(e.code, e.read().decode("utf-8", "replace")[:300])
 
 
 def requete_fichier(url, payload, image, methode="POST"):
-    """Envoi multipart. Le detail de l'echec est remonte tel quel : c'est la
-    seule facon de diagnostiquer un refus de Discord depuis le journal."""
-    """Envoi multipart : Discord exige ce format des qu'un fichier accompagne
-    le message. Construit a la main pour rester sans dependance."""
+    """Envoi multipart : Discord l'exige des qu'un fichier accompagne le
+    message. Construit a la main pour rester sans dependance externe."""
     limite = "----gdc{}".format(int(time.time() * 1000))
     nl = b"\r\n"
     corps = b""
@@ -896,7 +906,7 @@ def requete_fichier(url, payload, image, methode="POST"):
                 time.sleep(min(attente + 1, 30))
                 continue
             print("  [multipart] {} -> HTTP {} : {}".format(methode, e.code, detail))
-            raise RuntimeError("HTTP {} : {}".format(e.code, detail))
+            raise ErreurDiscord(e.code, detail)
         except urllib.error.URLError as e:
             if essai < 3:
                 print("  [multipart] reseau ({}), nouvelle tentative".format(e.reason))
@@ -946,9 +956,18 @@ def _publier(contenu, cle_jour, image, url, fichier_etat):
             else:
                 requete(cible, payload, "PATCH")
             return "modifie"
-        except urllib.error.HTTPError as e:
-            if e.code != 404:               # 404 = message supprime a la main
+        except (ErreurDiscord, urllib.error.HTTPError) as e:
+            # 404 = le message memorise n'existe plus (supprime a la main,
+            # salon vide, webhook recree). On oublie l'identifiant et on en
+            # publie un neuf juste en dessous.
+            if getattr(e, "code", None) != 404:
                 raise
+            print("Message {} introuvable : un nouveau va etre cree.".format(
+                etat.get("id")))
+            try:
+                os.remove(fichier_etat)
+            except OSError:
+                pass
 
     if image:
         rep = requete_fichier(url + "?wait=true", payload, image, "POST")
