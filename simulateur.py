@@ -122,6 +122,9 @@ F_TOKEN   = os.path.join(DOSSIER, "cr_token.txt")
 F_WEBHOOK = os.path.join(DOSSIER, "discord_webhook.txt")
 F_MESSAGE = os.path.join(DOSSIER, "message_simulateur.json")
 F_RELANCE = os.path.join(DOSSIER, "message_relance.json")
+# Journal des projections : une ligne par passage, pour pouvoir confronter
+# ensuite nos previsions au resultat reel (voir bilan.py).
+D_JOURNAL = os.path.join(DOSSIER, "journal_projections")
 # Salon ou paraissent les joueurs a relancer (a defaut : salon du classement,
 # puis salon principal)
 F_WEBHOOK_RELANCE = os.path.join(DOSSIER, "discord_webhook_relance.txt")
@@ -659,8 +662,9 @@ def construire_message(data, clans, large=False, sans_image=False):
             "Semaine {} - fin dans {} ({})".format(
                 semaine, duree_lisible(temps_restant()),
                 fin_locale.strftime("%Hh%M")))
-        if image is None:               # Pillow absent : repli silencieux
+        if image is None:               # Pillow absent : repli annonce
             mode = "mobile"
+            raison = _raison_image or "cause inconnue"
     if image is None:
         lignes = tableau_large(clans, nous) if mode == "large" \
             else tableau_mobile(clans, nous)
@@ -682,6 +686,9 @@ def construire_message(data, clans, large=False, sans_image=False):
         if not all(c["detaille"] for c in clans):
             corps += "\n-# Projections approchees pour les clans sans detail " \
                      "par joueur."
+    if mode == "mobile" and AFFICHAGE == "image" and not sans_image:
+        corps += "\n-# Tableau en texte : {}".format(
+            _raison_image or "image indisponible")
     corps += "\n-# PLANCHER = tout est perdu et les decks entames ne sont jamais " \
              "termines. MOYEN et PLAFOND supposent tous les decks joues."
     iv = intervalle_courant()
@@ -764,11 +771,16 @@ def _police(taille, gras=False):
         return ImageFont.load_default()
 
 
+_raison_image = None       # pourquoi la derniere image n'a pas pu etre envoyee
+
+
 def generer_image(lignes, titre):
     """Rend un tableau en PNG. Renvoie des octets, ou None si Pillow manque."""
+    global _raison_image
     try:
         from PIL import Image, ImageDraw
     except ImportError:
+        _raison_image = "Pillow n'est pas installe"
         return None
 
     police = _police(IMG_TAILLE)
@@ -843,6 +855,8 @@ def requete(url, data=None, methode="POST"):
 
 
 def requete_fichier(url, payload, image, methode="POST"):
+    """Envoi multipart. Le detail de l'echec est remonte tel quel : c'est la
+    seule facon de diagnostiquer un refus de Discord depuis le journal."""
     """Envoi multipart : Discord exige ce format des qu'un fichier accompagne
     le message. Construit a la main pour rester sans dependance."""
     limite = "----gdc{}".format(int(time.time() * 1000))
@@ -859,18 +873,37 @@ def requete_fichier(url, payload, image, methode="POST"):
     corps += image + nl
     corps += b"--" + limite.encode() + b"--" + nl
 
-    req = urllib.request.Request(url, data=corps, headers={
-        "Content-Type": "multipart/form-data; boundary=" + limite,
-        "User-Agent": "gdc-simulateur/1.0"}, method=methode)
-    try:
-        with urllib.request.urlopen(req, timeout=60,
-                                    context=ssl.create_default_context()) as r:
-            texte = r.read().decode("utf-8")
-            return json.loads(texte) if texte.strip() else {}
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "replace")[:400]
-        raise RuntimeError("Discord a refuse l'envoi multipart "
-                           "(HTTP {}) : {}".format(e.code, detail))
+    for essai in range(4):
+        req = urllib.request.Request(url, data=corps, headers={
+            "Content-Type": "multipart/form-data; boundary=" + limite,
+            "User-Agent": "gdc-simulateur/1.0"}, method=methode)
+        try:
+            with urllib.request.urlopen(req, timeout=90,
+                                        context=ssl.create_default_context()) as r:
+                texte = r.read().decode("utf-8")
+                return json.loads(texte) if texte.strip() else {}
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:400]
+            if e.code == 429 and essai < 3:
+                # Envoyer une image compte plus lourd qu'un simple texte dans
+                # les quotas de Discord : on patiente le temps demande.
+                attente = 5.0
+                try:
+                    attente = float(json.loads(detail).get("retry_after", 5))
+                except Exception:
+                    pass
+                print("  [multipart] limite de debit, attente {:.1f}s".format(attente))
+                time.sleep(min(attente + 1, 30))
+                continue
+            print("  [multipart] {} -> HTTP {} : {}".format(methode, e.code, detail))
+            raise RuntimeError("HTTP {} : {}".format(e.code, detail))
+        except urllib.error.URLError as e:
+            if essai < 3:
+                print("  [multipart] reseau ({}), nouvelle tentative".format(e.reason))
+                time.sleep(4 * (essai + 1))
+                continue
+            raise RuntimeError("reseau : {}".format(e.reason))
+    raise RuntimeError("envoi multipart impossible apres 4 tentatives")
 
 
 def publier(contenu, cle_jour, image=None, clans=None, nous=None,
@@ -891,6 +924,8 @@ def publier(contenu, cle_jour, image=None, clans=None, nous=None,
         secours = contenu
         if clans:
             secours += "\n```\n" + "\n".join(tableau_mobile(clans, nous)) + "\n```"
+        secours += "\n-# Tableau en texte : Discord a refuse l'image ({})".format(
+            str(e)[:180])
         return _publier(secours, cle_jour, None, url, fichier_etat) + " (sans image)"
 
 
@@ -925,6 +960,43 @@ def _publier(contenu, cle_jour, image, url, fichier_etat):
 
 
 # --------------------------------------------------------------------------
+
+# Nom de fichier fige au demarrage : la tache du matin et celle de la fin de
+# journee ecrivent ainsi dans deux fichiers distincts, ce qui evite tout
+# conflit quand elles les deposent toutes les deux dans le depot.
+_fichier_journal = None
+
+
+def noter_projections(data, clans):
+    """Archive les projections du passage en cours, une ligne par passage."""
+    global _fichier_journal
+    try:
+        os.makedirs(D_JOURNAL, exist_ok=True)
+        if _fichier_journal is None:
+            _fichier_journal = os.path.join(D_JOURNAL, "s{}p{}-{}.jsonl".format(
+                data.get("sectionIndex"), data.get("periodIndex"),
+                datetime.now(timezone.utc).strftime("%Y%m%d%H%M")))
+        ligne = {
+            "t": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "reste_min": int(temps_restant().total_seconds() / 60),
+            "semaine": (data.get("sectionIndex", 0) or 0) + 1,
+            "periode": data.get("periodIndex"),
+            "clans": [{
+                "tag": c["tag"], "nom": c["nom"], "score": c["score"],
+                "faits": c["decks_faits"], "dispo": c["decks_dispo"],
+                "entames": c["decks_entames"],
+                "fiab": round(c.get("fiab_clan", 0), 4),
+                "plancher": round(c["plancher"]),
+                "attendu": round(c.get("attendu", c["moyenne"])),
+                "moyen": round(c["moyenne"]),
+                "plafond": round(c["plafond"]),
+            } for c in clans],
+        }
+        with open(_fichier_journal, "a", encoding="utf-8") as f:
+            f.write(json.dumps(ligne, ensure_ascii=False) + "\n")
+    except Exception as e:                     # ne doit jamais bloquer le suivi
+        print("Journal non ecrit : {}".format(e))
+
 
 def fin_locale_str(data):
     return heure_fr(datetime.now(timezone.utc)
@@ -972,6 +1044,9 @@ def un_passage(args):
                     j["dernier"] = dernier_combat(j["tag"], j["utilises"])
                 c["fine"] = True
 
+    if not args.sans_journal:
+        noter_projections(data, clans)
+
     message, image = construire_message(data, clans, large=args.large,
                                         sans_image=args.sans_image)
 
@@ -981,7 +1056,8 @@ def un_passage(args):
         pass
     print("\n" + message.replace("```", "").replace("**", "").replace("-# ", ""))
     if image:
-        print("\n[tableau joint en image : {} Ko]".format(len(image) // 1024))
+        print("\n[tableau joint en image : {} Ko, {} lignes]".format(
+            len(image) // 1024, len(tableau_large(clans, nous))))
         for l in tableau_large(clans, next(
                 (c for c in clans
                  if c["tag"].lstrip("#") == CLAN_TAG.lstrip("#").upper()), None)):
@@ -1006,6 +1082,7 @@ def un_passage(args):
         action = publier(message, jour, image, clans, nous)
         print("\nDiscord (strategie) : message {}.".format(action))
         if texte_relance:
+            time.sleep(2)
             action = publier(texte_relance, jour, image_relance,
                              url=webhook_relance(), fichier_etat=F_RELANCE)
             print("Discord (relance)   : message {}.".format(action))
@@ -1042,6 +1119,8 @@ def main():
                     help="tableau en colonnes en texte au lieu de l'image")
     ap.add_argument("--test-discord", action="store_true",
                     help="envoyer un message de test avec l'image, pour verifier")
+    ap.add_argument("--sans-journal", action="store_true",
+                    help="ne pas archiver les projections")
     ap.add_argument("--sans-fiabilite", action="store_true",
                     help="ne pas calculer la fiabilite ni la liste de relance")
     ap.add_argument("--sans-image", action="store_true",
