@@ -29,6 +29,10 @@ jobs:
         env:
           CR_API_TOKEN: ${{ secrets.CR_API_TOKEN }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          # Salon des joueurs a relancer : RELANCE s'il existe, sinon
+          # CLASSEMENT, sinon le salon principal
+          DISCORD_WEBHOOK_RELANCE: ${{ secrets.DISCORD_WEBHOOK_RELANCE }}
+          DISCORD_WEBHOOK_CLASSEMENT: ${{ secrets.DISCORD_WEBHOOK_CLASSEMENT }}
         run: python simulateur.py
 
       - name: Memoriser le message
