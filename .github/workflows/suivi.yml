@@ -1,0 +1,70 @@
+name: Suivi GDC
+
+# POURQUOI TOUTES LES HEURES ?
+# GitHub lance les taches planifiees "au mieux", et sur ce depot elles
+# arrivent avec environ cinq heures de retard, de facon reguliere. Viser une
+# heure precise ne sert donc a rien : la journee de guerre serait finie.
+#
+# En planifiant toutes les heures, la CADENCE est preservee meme avec du
+# retard : il arrive une execution par heure quoi qu'il arrive. Celles qui
+# tombent hors de la fenetre de suivi s'arretent en une dizaine de secondes ;
+# la premiere qui tombe dedans prend le relais et travaille.
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Deux executions ne doivent jamais se marcher dessus : elles reecrivent le
+# meme message Discord. La suivante attend la fin de la precedente.
+concurrency:
+  group: suivi-gdc
+  cancel-in-progress: false
+
+jobs:
+  suivi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer Pillow (rendu du tableau en image)
+        run: pip install --quiet pillow
+
+      # --duree-max laisse la main a l'execution suivante avant que GitHub ne
+      # coupe le job a 6 heures : les executions se passent le relais.
+      - name: Suivi de la journee de guerre
+        env:
+          CR_API_TOKEN: ${{ secrets.CR_API_TOKEN }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DISCORD_WEBHOOK_RELANCE: ${{ secrets.DISCORD_WEBHOOK_RELANCE }}
+          DISCORD_WEBHOOK_CLASSEMENT: ${{ secrets.DISCORD_WEBHOOK_CLASSEMENT }}
+        run: python simulateur.py --duree-max 300
+
+      # Ne publie que si une journee complete vient de s'achever et n'a pas
+      # deja fait l'objet d'un bilan.
+      - name: Bilan de fiabilite des projections
+        if: always()
+        env:
+          CR_API_TOKEN: ${{ secrets.CR_API_TOKEN }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DISCORD_WEBHOOK_BILAN: ${{ secrets.DISCORD_WEBHOOK_BILAN }}
+        run: python bilan.py --une-fois-par-jour
+
+      - name: Memoriser l'etat
+        if: always()
+        run: |
+          date -u +"Derniere execution : %Y-%m-%d %H:%M UTC" > derniere_execution.txt
+          git config user.name "github-actions"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add derniere_execution.txt message_simulateur.json \
+                  message_relance.json bilan_publie.json \
+                  journal_projections || true
+          git commit -m "suivi $(date -u +'%F %H:%M')" || exit 0
+          git pull --rebase --autostash || true
+          git push
