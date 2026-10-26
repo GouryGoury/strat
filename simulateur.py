@@ -449,18 +449,42 @@ def enrichir(projection, clan_brut, avec_horaires=False):
     du reel : ni le pessimisme du plancher, ni l'optimisme du moyen qui
     suppose que tout le monde joue."""
     joueurs = joueurs_en_attente(clan_brut, projection["tag"], avec_horaires)
-    projection["joueurs"] = joueurs
 
-    connus = [j["fiab"] for j in joueurs if j["fiab"] is not None]
+    # Fiabilite du CLAN : moyenne sur tout l'effectif, pas sur les seuls
+    # joueurs en attente. Sinon le taux affiche se mettrait a decrire les
+    # derniers retardataires au fur et a mesure que les autres finissent,
+    # et finirait par ne plus rien vouloir dire.
+    histo = historique_clan(projection["tag"])
+    connus = [f for f in (fiabilite(m.get("tag"), histo)
+                          for m in membres_clan(projection["tag"])) if f is not None]
     moyenne_clan = sum(connus) / len(connus) if connus else FIABILITE_DEFAUT
     projection["fiab_clan"] = moyenne_clan
 
-    decks_identifies = sum(j["restants"] for j in joueurs)
+    restants_reels = projection["decks_restants"]
+    identifies = sum(j["restants"] for j in joueurs)
+
+    # La liste des participants de la semaine contient des joueurs partis :
+    # leurs combats comptent dans le total du clan, mais des membres arrives
+    # depuis apparaissent alors comme "en attente". Le nombre de combats
+    # restants calcule au niveau du clan fait foi, on rogne la liste dessus.
+    if identifies > restants_reels:
+        joueurs.sort(key=lambda j: (-(j["restants"] * (1 - poids(j))),
+                                    j["nom"].lower()))
+        cumul, gardes = 0, []
+        for j in joueurs:
+            if cumul >= restants_reels:
+                break
+            j["restants"] = min(j["restants"], restants_reels - cumul)
+            cumul += j["restants"]
+            gardes.append(j)
+        joueurs = gardes
+        identifies = cumul
+
+    projection["joueurs"] = joueurs
     esperes = sum(j["restants"] * poids(j) for j in joueurs)
-    # Les places vides du clan sont comptees comme 200 decks au total : on
-    # applique a ce reliquat anonyme la fiabilite moyenne du clan.
-    anonymes = max(0, projection["decks_restants"] - decks_identifies)
-    esperes += anonymes * moyenne_clan
+    # Les places non identifiees sont comptees a la fiabilite moyenne du clan.
+    esperes += max(0, restants_reels - identifies) * moyenne_clan
+    esperes = min(esperes, restants_reels)      # jamais plus que le possible
 
     projection["decks_attendus"] = esperes
     projection["attendu"] = projection["score"] + esperes * projection["moyenne_deck"]
@@ -715,8 +739,9 @@ def tableau_relance(nous, avec_horaires):
     joueurs = sorted(nous.get("joueurs", []),
                      key=lambda j: (-(j["restants"] * (1 - poids(j))),
                                     j["nom"].lower()))
-    if not joueurs:
-        return ["Tous les membres ont joue leurs combats."]
+    if not joueurs or nous.get("decks_restants", 0) <= 0:
+        return ["Tous les combats du clan sont joues ({} / {}).".format(
+            nous.get("decks_faits", 0), MEMBRES_PAR_CLAN * DECKS_PAR_JOUEUR)]
 
     visibles = joueurs[:RELANCE_MAX]
     lp = min(16, max([largeur(j["nom"]) for j in visibles] + [8]))
@@ -1214,14 +1239,22 @@ def main():
         return
 
     try:
-        echecs = 0
+        echecs, sans_guerre = 0, 0
         while temps_restant().total_seconds() > max(60, arret):
+            if sans_guerre >= 3:
+                # Entre deux guerres (du lundi midi au jeudi soir), il n'y a
+                # rien a suivre : inutile de tourner dans le vide pendant des
+                # heures, l'execution horaire suivante verra bien quand la
+                # guerre reprendra.
+                print("\nAucune guerre en cours : arret, la prochaine "
+                      "execution verra la reprise.")
+                return
             if limite and time.time() >= limite:
                 print("\nDuree maximale atteinte : la prochaine execution "
                       "planifiee prendra le relais.")
                 return
             try:
-                un_passage(args)
+                sans_guerre = 0 if un_passage(args) else sans_guerre + 1
                 echecs = 0
             except Exception as e:
                 echecs += 1
