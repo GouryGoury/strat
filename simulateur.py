@@ -1148,6 +1148,9 @@ def main():
                     help="forcer un intervalle fixe, en minutes")
     ap.add_argument("--heures", type=float,
                     help="ne tourner que pendant les N dernieres heures de la journee")
+    ap.add_argument("--duree-max", type=int, metavar="MIN",
+                    help="duree maximale de la boucle, pour laisser la main a "
+                         "l'execution suivante avant la limite de GitHub")
     ap.add_argument("--arret-a", type=int, metavar="MIN",
                     help="s'arreter quand il reste moins de MIN minutes "
                          "(pour decouper le suivi en plusieurs taches)")
@@ -1191,6 +1194,7 @@ def main():
         return
 
     arret = (args.arret_a or 0) * 60
+    limite = time.time() + (args.duree_max or 0) * 60 if args.duree_max else None
     print("Boucle demarree : {} restant. Cadence : {}.".format(
         duree_lisible(temps_restant()),
         ", ".join("{} min a -{}h{:02d}".format(i, s // 60, s % 60)
@@ -1212,6 +1216,10 @@ def main():
     try:
         echecs = 0
         while temps_restant().total_seconds() > max(60, arret):
+            if limite and time.time() >= limite:
+                print("\nDuree maximale atteinte : la prochaine execution "
+                      "planifiee prendra le relais.")
+                return
             try:
                 un_passage(args)
                 echecs = 0
