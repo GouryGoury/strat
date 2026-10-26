@@ -31,6 +31,7 @@ DOSSIER   = os.path.dirname(os.path.abspath(__file__))
 D_JOURNAL = os.path.join(DOSSIER, "journal_projections")
 F_WEBHOOK = os.path.join(DOSSIER, "discord_webhook.txt")
 F_WEBHOOK_BILAN = os.path.join(DOSSIER, "discord_webhook_bilan.txt")
+F_DEJA = os.path.join(DOSSIER, "bilan_publie.json")
 NOM_BOT   = "Bilan GDC"
 
 # Tranches d'analyse, en minutes restantes avant la bascule
@@ -223,6 +224,9 @@ def main():
     ap.add_argument("--jours", type=int, default=1,
                     help="nombre de journees de guerre a cumuler (defaut 1)")
     ap.add_argument("--fichiers", default=D_JOURNAL, help="dossier des journaux")
+    ap.add_argument("--une-fois-par-jour", action="store_true",
+                    help="ne rien publier si le bilan de cette journee est "
+                         "deja paru (le suivi tourne toutes les heures)")
     args = ap.parse_args()
 
     try:
@@ -245,6 +249,17 @@ def main():
     completes.sort(key=lambda cle: journees[cle][-1]["t"])
     cles = completes[-args.jours:]
 
+    if args.une_fois_par_jour:
+        deja = []
+        try:
+            with open(F_DEJA, "r", encoding="utf-8") as f:
+                deja = json.load(f).get("journees", [])
+        except Exception:
+            pass
+        if list(cles[-1]) in deja:
+            print("Bilan de cette journee deja publie : rien a faire.")
+            return
+
     titre = ("**BILAN DE FIABILITE - {} journee(s) de guerre**".format(len(cles))
              if len(cles) > 1 else
              "**BILAN DE FIABILITE - semaine {}, journee {}**".format(
@@ -256,6 +271,10 @@ def main():
     if not args.rapport:
         publier(texte)
         print("\nPublie sur Discord.")
+        if args.une_fois_par_jour:
+            deja.append(list(cles[-1]))
+            with open(F_DEJA, "w", encoding="utf-8") as f:
+                json.dump({"journees": deja[-30:]}, f)
 
 
 if __name__ == "__main__":
