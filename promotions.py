@@ -40,8 +40,7 @@ NOM_BOT  = "Promotions GDC"
 
 DOSSIER   = os.path.dirname(os.path.abspath(__file__))
 F_TOKEN   = os.path.join(DOSSIER, "cr_token.txt")
-# Salon dedie si tu en veux un (sinon le webhook principal est utilise) :
-F_WEBHOOK_PROMO = os.path.join(DOSSIER, "discord_webhook_promotions.txt")
+# La liste part dans le salon strategie, celui du webhook principal.
 F_WEBHOOK = os.path.join(DOSSIER, "discord_webhook.txt")
 
 # ==========================================================================
@@ -170,10 +169,7 @@ def construire(resultats, semaines, proches):
 # --------------------------------------------------------------------------
 
 def publier(contenu):
-    url = (os.environ.get("DISCORD_WEBHOOK_PROMOTIONS")
-           or lire_fichier(F_WEBHOOK_PROMO)
-           or os.environ.get("DISCORD_WEBHOOK")
-           or lire_fichier(F_WEBHOOK))
+    url = os.environ.get("DISCORD_WEBHOOK") or lire_fichier(F_WEBHOOK)
     if not url or not url.startswith("https://discord.com/api/webhooks/"):
         sys.exit("Webhook Discord introuvable ou invalide.")
     for morceau in decouper(contenu):
