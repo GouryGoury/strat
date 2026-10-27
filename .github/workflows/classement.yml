@@ -36,9 +36,9 @@ jobs:
         if: always()
         env:
           CR_API_TOKEN: ${{ secrets.CR_API_TOKEN }}
+          # La liste des promotions part dans le salon strategie,
+          # c'est-a-dire le webhook principal.
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          # Secret facultatif : pour publier dans un salon different
-          DISCORD_WEBHOOK_PROMOTIONS: ${{ secrets.DISCORD_WEBHOOK_PROMOTIONS }}
         run: python promotions.py
 
       # deja_publie.json doit survivre d'une execution a l'autre, sinon le
