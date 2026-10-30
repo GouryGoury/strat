@@ -61,6 +61,19 @@ FIABILITE_DEFAUT   = 0.75     # joueur sans historique exploitable
 HEURES_INACTIF     = 6        # au-dela, un joueur en attente devient douteux
 RELANCE_MAX        = 20       # lignes affichees dans la liste de relance
 
+# --- colisee (derniere semaine de la saison) -------------------------------
+# Le score ne retombe pas a zero chaque jour : il se cumule jusqu'au lundi.
+# Plus d'attaques de bateau. Les combats non joues dans la journee sont
+# definitivement perdus : la capacite restante de la semaine, c'est ce qui
+# reste aujourd'hui plus 200 par jour entier a venir, rien de plus.
+JOURS_COLISEE      = 4
+# L'API numerote les periodes depuis le DEBUT DE LA SAISON, pas de la semaine :
+# periodIndex 25 = semaine 25//7 = 3, jour 25%7 = 4 dans la semaine.
+# Une semaine compte 7 periodes : 3 d'entrainement (0 a 2) puis les 4 journees
+# de guerre (3 a 6).
+PERIODES_PAR_SEMAINE = 7
+PREMIERE_PERIODE_GUERRE = 3
+
 # Analyse fine des adversaires (journal de combats) : couteuse en appels, donc
 # reservee a la fin de journee et aux clans ou il ne manque plus grand monde.
 ADVERSAIRES_DERNIERE_MIN = 60
@@ -365,6 +378,28 @@ def poids(j):
 # Modele
 # --------------------------------------------------------------------------
 
+def contexte_semaine(data):
+    """Determine s'il s'agit d'un colisee et combien de jours restent apres
+    aujourd'hui. Hors colisee, tout le reste du programme est inchange."""
+    genre = (data.get("periodType") or "").lower()
+    colisee = "coloss" in genre
+
+    # ATTENTION : periodLogs cumule les journees depuis le debut de la SAISON
+    # (12 entrees au milieu de la 4e semaine), il ne dit donc rien sur la
+    # semaine en cours. Seul le reste de periodIndex modulo 7 est exploitable.
+    idx = data.get("periodIndex")
+    if idx is None:
+        jour_semaine = PREMIERE_PERIODE_GUERRE
+    else:
+        jour_semaine = idx % PERIODES_PAR_SEMAINE
+    derniere = PREMIERE_PERIODE_GUERRE + JOURS_COLISEE - 1
+    jour = min(JOURS_COLISEE,
+               max(1, jour_semaine - PREMIERE_PERIODE_GUERRE + 1))
+    jours_apres = max(0, min(JOURS_COLISEE - 1, derniere - jour_semaine))
+    return {"colisee": colisee, "jours_apres": jours_apres if colisee else 0,
+            "jour": jour}
+
+
 def plafond_joueur(decks_restants):
     """Meilleur score possible pour un joueur avec N decks restants.
 
@@ -378,15 +413,24 @@ def plafond_joueur(decks_restants):
     return d * PTS_COMBAT_GAGNE
 
 
-def projeter(clan):
-    """Calcule la situation et les trois projections d'un clan."""
+def projeter(clan, ctx=None):
+    """Calcule la situation et les projections d'un clan."""
+    ctx = ctx or {"colisee": False, "jours_apres": 0, "jour": 1}
     nom = clan.get("name") or "?"
     parts = clan.get("participants") or []
-    score = clan.get("periodPoints")
-    if score is None:                      # secours si le champ manque
-        score = clan.get("fame", 0) or 0
+
+    if ctx["colisee"]:
+        # Le score qui compte est le cumul de la semaine, pas celui du jour.
+        score = clan.get("fame")
+        if score is None:
+            score = clan.get("periodPoints", 0) or 0
+    else:
+        score = clan.get("periodPoints")
+        if score is None:
+            score = clan.get("fame", 0) or 0
 
     decks_faits = sum(p.get("decksUsedToday") or 0 for p in parts)
+    decks_semaine = sum(p.get("decksUsed") or 0 for p in parts)
     detail = any("decksUsedToday" in p for p in parts)
 
     # Le total du jour est l'effectif du clan x 4, pas la taille de la liste
@@ -419,24 +463,55 @@ def projeter(clan):
         plafond_sup = decks_restants * (plafond_joueur(DECKS_PAR_JOUEUR)
                                         / float(DECKS_PAR_JOUEUR))
 
-    moyenne_deck = (float(score) / decks_faits) if decks_faits else PTS_COMBAT_GAGNE
+    # Moyenne par combat : sur le cumul de la semaine en colisee (beaucoup
+    # plus de combats, donc une moyenne bien plus stable), sur la journee
+    # sinon. Dans les deux cas on divise par les combats REELLEMENT joues,
+    # jamais par un maximum theorique.
+    if ctx["colisee"] and decks_semaine:
+        moyenne_deck = float(score) / decks_semaine
+    elif decks_faits:
+        moyenne_deck = float(score) / decks_faits
+    else:
+        moyenne_deck = PTS_COMBAT_GAGNE
+
+    # Capacite des journees entieres encore a venir. Les combats non joues
+    # aujourd'hui seront perdus : ils n'y figurent pas.
+    capacite_future = (ctx["jours_apres"] * MEMBRES_PAR_CLAN * DECKS_PAR_JOUEUR
+                       if ctx["colisee"] else 0)
+    max_par_deck = plafond_joueur(DECKS_PAR_JOUEUR) / float(DECKS_PAR_JOUEUR)
 
     return {
         "nom": nom,
         "tag": (clan.get("tag") or "").upper(),
         "score": score,
         "decks_faits": decks_faits,
+        "decks_semaine": decks_semaine,
         "decks_restants": decks_restants,
         "decks_dispo": decks_dispo,
         "decks_entames": decks_entames,
+        "capacite_future": capacite_future,
+        "colisee": ctx["colisee"],
+        "jours_apres": ctx["jours_apres"],
+        "jour": ctx["jour"],
+        # Rythme reellement constate : combats joues cette semaine divises par
+        # les journees entamees. C'est lui qui sert a projeter les jours a
+        # venir, et non les 200 theoriques : un clan qui joue 95 combats par
+        # jour n'en jouera pas 200 demain.
+        "rythme_jour": (float(decks_semaine) / max(1, ctx["jour"])
+                        if ctx["colisee"] else 0.0),
         "moyenne_deck": moyenne_deck,
         "detaille": detail,
         # Le plancher ne compte QUE les decks libres : les decks entames
         # dependent de joueurs precis qui peuvent ne jamais revenir, on ne
         # s'appuie pas dessus.
+        # En colisee ces trois bornes visent la fin du colisee, pas la fin de
+        # la journee : elles integrent donc les jours entiers restants.
         "plancher": score + decks_dispo * PTS_COMBAT_PERDU,
-        "moyenne": score + decks_restants * moyenne_deck,
-        "plafond": score + plafond_sup,
+        # MOYEN ne peut pas depasser PLAFOND : si la moyenne constatee frole
+        # le maximum theorique par combat, les deux se rejoignent.
+        "moyenne": min(score + (decks_restants + capacite_future) * moyenne_deck,
+                       score + plafond_sup + capacite_future * max_par_deck),
+        "plafond": score + plafond_sup + capacite_future * max_par_deck,
     }
 
 
@@ -487,7 +562,18 @@ def enrichir(projection, clan_brut, avec_horaires=False):
     esperes = min(esperes, restants_reels)      # jamais plus que le possible
 
     projection["decks_attendus"] = esperes
-    projection["attendu"] = projection["score"] + esperes * projection["moyenne_deck"]
+    # En colisee, les journees a venir sont projetees au rythme que le clan
+    # tient reellement depuis jeudi, plafonne au maximum possible. La
+    # fiabilite n'intervient pas ici : elle est deja contenue dans ce rythme.
+    futurs = 0.0
+    if projection.get("jours_apres"):
+        rythme = min(projection.get("rythme_jour", 0.0),
+                     MEMBRES_PAR_CLAN * DECKS_PAR_JOUEUR)
+        futurs = projection["jours_apres"] * rythme
+    projection["decks_futurs"] = futurs
+    total_esperes = esperes + futurs
+    projection["attendu"] = (projection["score"]
+                             + total_esperes * projection["moyenne_deck"])
     return projection
 
 
@@ -511,8 +597,52 @@ def budget_bateaux(nous, cible, victoires=0):
     return max(0, min(divertibles, int((plancher - cible) // cout)))
 
 
+def verdict_colisee(nous, adversaires):
+    """Pas d'attaques de bateau en colisee : la seule question est l'ecart."""
+    if not adversaires:
+        return "SEUL", "Aucun concurrent dans la course.", []
+
+    meilleur = max(adversaires, key=lambda c: c["score"])
+    ecart = nous["score"] - meilleur["score"]
+    pire = max(adversaires, key=lambda c: c["plafond"])
+    realiste = max(adversaires, key=lambda c: c.get("attendu", c["moyenne"]))
+    marge_pess = nous["plancher"] - pire["plafond"]
+    marge_real = nous.get("attendu", nous["moyenne"]) - realiste.get(
+        "attendu", realiste["moyenne"])
+
+    combats = int(abs(marge_real) / max(1.0, nous["moyenne_deck"])) + 1
+    if marge_pess > 0:
+        etat = "VICTOIRE ACQUISE"
+        texte = ("Meme si nous ne jouons plus rien et que {} gagne tout, "
+                 "le colisee est a nous ({} pts d'avance).").format(
+                     pire["nom"], fmt(marge_pess))
+    elif marge_real > 0:
+        etat = "EN TETE"
+        texte = ("{} pts d'avance attendue sur {}. Il leur faudrait environ "
+                 "{} combats gagnes de plus que nous pour repasser devant."
+                 ).format(fmt(marge_real), realiste["nom"], combats)
+    else:
+        etat = "DERRIERE"
+        texte = ("{} nous devance de {} pts a l'arrivee attendue : il nous "
+                 "manque environ {} combats gagnes.").format(
+                     realiste["nom"], fmt(-marge_real), combats)
+
+    plan = ["Score cumule depuis jeudi, {} ({} au classement du moment).".format(
+        "en tete" if ecart >= 0 else "a {} pts du premier".format(fmt(-ecart)),
+        "1er" if ecart >= 0 else meilleur["nom"])]
+    if nous.get("jours_apres"):
+        plan.append("Il reste {} journee(s) entiere(s) apres aujourd'hui, "
+                    "soit {} combats.".format(
+                        nous["jours_apres"], fmt(nous["capacite_future"])))
+    plan.append("Les combats non joues aujourd'hui seront perdus : ils ne se "
+                "reportent pas sur demain.")
+    return etat, texte, plan
+
+
 def verdict(nous, adversaires):
     """Verdict global + plan conditionnel au fil des resultats."""
+    if nous.get("colisee"):
+        return verdict_colisee(nous, adversaires)
     if not adversaires:
         return "FEU VERT", "Aucun concurrent dans la course.", []
 
@@ -557,6 +687,15 @@ def verdict(nous, adversaires):
 
 def lignes_plan(nous, plan):
     """Met le plan conditionnel en mots."""
+    if nous.get("colisee"):
+        lignes = list(plan)
+        restants = nous["decks_restants"]
+        if restants:
+            lignes.insert(1, "Aujourd'hui : {} combats restants ({} surs, "
+                             "{} entames).".format(restants,
+                                                   nous.get("decks_dispo", 0),
+                                                   nous.get("decks_entames", 0)))
+        return lignes
     restants = nous["decks_restants"]
     if restants <= 0:
         return ["Plus aucun combat disponible aujourd'hui."]
@@ -674,18 +813,30 @@ def construire_message(data, clans, large=False, sans_image=False):
 
     semaine = (data.get("sectionIndex", 0) or 0) + 1
     fin_locale = heure_fr(datetime.now(timezone.utc) + temps_restant())
-    corps = "**GUERRE DE CLAN - JOURNEE EN COURS**\n(semaine {}, fin dans {} " \
-            "- a {})".format(semaine, duree_lisible(temps_restant()),
-                             fin_locale.strftime("%Hh%M"))
+    colisee = bool(nous and nous.get("colisee"))
+    if colisee:
+        jours = nous.get("jours_apres", 0)
+        reste = ("dernier jour" if jours == 0
+                 else "{} jour(s) apres aujourd'hui".format(jours))
+        corps = ("**COLISEE - SEMAINE {}**\n"
+                 "(score cumule depuis jeudi - journee en cours jusqu'a {}, "
+                 "{})").format(semaine, fin_locale.strftime("%Hh%M"), reste)
+    else:
+        corps = ("**GUERRE DE CLAN - JOURNEE EN COURS**\n"
+                 "(semaine {}, fin dans {} - a {})").format(
+                     semaine, duree_lisible(temps_restant()),
+                     fin_locale.strftime("%Hh%M"))
 
     mode = "large" if large else AFFICHAGE
     image = None
     if mode == "image" and not sans_image:
         image = generer_image(
             tableau_large(clans, nous),
-            "Semaine {} - fin dans {} ({})".format(
+            ("Colisee - semaine {} - journee jusqu'a {}".format(
+                semaine, fin_locale.strftime("%Hh%M")) if colisee else
+             "Semaine {} - fin dans {} ({})".format(
                 semaine, duree_lisible(temps_restant()),
-                fin_locale.strftime("%Hh%M")))
+                fin_locale.strftime("%Hh%M"))))
         if image is None:               # Pillow absent : repli annonce
             mode = "mobile"
             raison = _raison_image or "cause inconnue"
@@ -713,8 +864,13 @@ def construire_message(data, clans, large=False, sans_image=False):
     if mode == "mobile" and AFFICHAGE == "image" and not sans_image:
         corps += "\n-# Tableau en texte : {}".format(
             _raison_image or "image indisponible")
-    corps += "\n-# PLANCHER = tout est perdu et les decks entames ne sont jamais " \
-             "termines. MOYEN et PLAFOND supposent tous les decks joues."
+    if colisee:
+        corps += "\n-# Projections a la FIN DU COLISEE. Les combats non joues " \
+                 "dans la journee sont perdus : seuls les jours entiers " \
+                 "restants s'ajoutent."
+    else:
+        corps += "\n-# PLANCHER = tout est perdu et les decks entames ne sont " \
+                 "jamais termines. MOYEN et PLAFOND supposent tous les decks joues."
     iv = intervalle_courant()
     maintenant = heure_fr()
     suivante = maintenant + timedelta(minutes=iv)
@@ -1025,6 +1181,7 @@ def noter_projections(data, clans):
             "reste_min": int(temps_restant().total_seconds() / 60),
             "semaine": (data.get("sectionIndex", 0) or 0) + 1,
             "periode": data.get("periodIndex"),
+            "colisee": bool(clans and clans[0].get("colisee")),
             "clans": [{
                 "tag": c["tag"], "nom": c["nom"], "score": c["score"],
                 "faits": c["decks_faits"], "dispo": c["decks_dispo"],
@@ -1065,10 +1222,11 @@ def un_passage(args):
               "en cours.")
         return False
 
+    ctx = contexte_semaine(data)
     cible = CLAN_TAG.lstrip("#").upper()
     clans, bruts_par_tag = [], {}
     for brut in bruts:
-        p = projeter(brut)
+        p = projeter(brut, ctx)
         bruts_par_tag[p["tag"].lstrip("#")] = brut
         clans.append(p)
     nous = next((c for c in clans if c["tag"].lstrip("#") == cible), None)
