@@ -598,19 +598,43 @@ def budget_bateaux(nous, cible, victoires=0):
 
 
 def verdict_colisee(nous, adversaires):
-    """Pas d'attaques de bateau en colisee : la seule question est l'ecart."""
+    """En colisee il n'y a plus de bateaux : la seule question est l'ecart.
+
+    Tant qu'il reste des journees entieres a jouer, une projection de fin n'a
+    aucune valeur de decision : trop de combats restent a jouer pour que l'ecart
+    attendu veuille dire quoi que ce soit. On se contente alors de situer le
+    clan. Le verdict complet n'apparait qu'au dernier jour."""
+    restants = nous["decks_restants"]
+    aujourdhui = ("Aujourd'hui : {} combats restants ({} surs, {} entames).".format(
+        restants, nous.get("decks_dispo", 0), nous.get("decks_entames", 0))
+        if restants else "Tous nos combats du jour sont joues.")
+
     if not adversaires:
-        return "SEUL", "Aucun concurrent dans la course.", []
+        return "SEUL", "Aucun concurrent dans la course.", [aujourdhui]
 
     meilleur = max(adversaires, key=lambda c: c["score"])
     ecart = nous["score"] - meilleur["score"]
+    rang = 1 + sum(1 for c in adversaires if c["score"] > nous["score"])
+
+    # --- avant le dernier jour : simple point de situation ----------------
+    if nous.get("jours_apres", 0) > 0:
+        if ecart >= 0:
+            texte = "{}er du colisee, {} pts devant {}.".format(
+                rang, fmt(ecart), meilleur["nom"])
+        else:
+            texte = "{}e du colisee, {} pts derriere {}.".format(
+                rang, fmt(-ecart), meilleur["nom"])
+        return ("JOUR {} SUR {}".format(nous.get("jour", 1), JOURS_COLISEE),
+                texte, [aujourdhui])
+
+    # --- dernier jour : la projection devient decisive --------------------
     pire = max(adversaires, key=lambda c: c["plafond"])
     realiste = max(adversaires, key=lambda c: c.get("attendu", c["moyenne"]))
     marge_pess = nous["plancher"] - pire["plafond"]
     marge_real = nous.get("attendu", nous["moyenne"]) - realiste.get(
         "attendu", realiste["moyenne"])
-
     combats = int(abs(marge_real) / max(1.0, nous["moyenne_deck"])) + 1
+
     if marge_pess > 0:
         etat = "VICTOIRE ACQUISE"
         texte = ("Meme si nous ne jouons plus rien et que {} gagne tout, "
@@ -626,17 +650,7 @@ def verdict_colisee(nous, adversaires):
         texte = ("{} nous devance de {} pts a l'arrivee attendue : il nous "
                  "manque environ {} combats gagnes.").format(
                      realiste["nom"], fmt(-marge_real), combats)
-
-    plan = ["Score cumule depuis jeudi, {} ({} au classement du moment).".format(
-        "en tete" if ecart >= 0 else "a {} pts du premier".format(fmt(-ecart)),
-        "1er" if ecart >= 0 else meilleur["nom"])]
-    if nous.get("jours_apres"):
-        plan.append("Il reste {} journee(s) entiere(s) apres aujourd'hui, "
-                    "soit {} combats.".format(
-                        nous["jours_apres"], fmt(nous["capacite_future"])))
-    plan.append("Les combats non joues aujourd'hui seront perdus : ils ne se "
-                "reportent pas sur demain.")
-    return etat, texte, plan
+    return etat, texte, [aujourdhui]
 
 
 def verdict(nous, adversaires):
@@ -688,14 +702,7 @@ def verdict(nous, adversaires):
 def lignes_plan(nous, plan):
     """Met le plan conditionnel en mots."""
     if nous.get("colisee"):
-        lignes = list(plan)
-        restants = nous["decks_restants"]
-        if restants:
-            lignes.insert(1, "Aujourd'hui : {} combats restants ({} surs, "
-                             "{} entames).".format(restants,
-                                                   nous.get("decks_dispo", 0),
-                                                   nous.get("decks_entames", 0)))
-        return lignes
+        return list(plan)
     restants = nous["decks_restants"]
     if restants <= 0:
         return ["Plus aucun combat disponible aujourd'hui."]
