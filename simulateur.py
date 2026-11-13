@@ -619,11 +619,13 @@ def verdict_colisee(nous, adversaires):
     # --- avant le dernier jour : simple point de situation ----------------
     if nous.get("jours_apres", 0) > 0:
         if ecart >= 0:
-            texte = "{}er du colisee, {} pts devant {}.".format(
-                rang, fmt(ecart), meilleur["nom"])
+            texte = "{} du colisee, {} pts devant {}.".format(
+                "1er" if rang == 1 else "{}e".format(rang),
+                fmt(ecart), meilleur["nom"])
         else:
-            texte = "{}e du colisee, {} pts derriere {}.".format(
-                rang, fmt(-ecart), meilleur["nom"])
+            texte = "{} du colisee, {} pts derriere {}.".format(
+                "1er" if rang == 1 else "{}e".format(rang),
+                fmt(-ecart), meilleur["nom"])
         return ("JOUR {} SUR {}".format(nous.get("jour", 1), JOURS_COLISEE),
                 texte, [aujourdhui])
 
@@ -654,49 +656,100 @@ def verdict_colisee(nous, adversaires):
 
 
 def verdict(nous, adversaires):
-    """Verdict global + plan conditionnel au fil des resultats."""
+    """Verdict global + plan conditionnel au fil des resultats.
+
+    Le raisonnement porte sur la PLACE, pas sur l'ecart au meilleur clan :
+    etre derriere un clan qu'on ne rattrapera jamais ne change rien a la
+    decision. Deux questions seulement :
+      - quelqu'un peut-il encore nous depasser ?  (sinon rien a defendre)
+      - pouvons-nous encore depasser quelqu'un ?  (sinon rien a gagner)
+    Si la reponse est non aux deux, la place est figee : les combats restants
+    ne rapportent plus un seul rang, autant les passer sur les bateaux.
+    """
     if nous.get("colisee"):
         return verdict_colisee(nous, adversaires)
-    if not adversaires:
-        return "FEU VERT", "Aucun concurrent dans la course.", []
-
-    pire = max(adversaires, key=lambda c: c["plafond"])
-    realiste = max(adversaires, key=lambda c: c["moyenne"])
-    marge_pessimiste = nous["plancher"] - pire["plafond"]
-    marge_realiste = nous["moyenne"] - realiste["moyenne"]
     restants = nous["decks_restants"]
+    if not adversaires:
+        return "FEU VERT", "Aucun concurrent dans la course.", [(0, restants)]
 
-    # --- plan progressif : budget bateaux selon les combats gagnes ---------
+    attendu_nous = nous.get("attendu", nous["moyenne"])
+    dessous = [c for c in adversaires if c["score"] <= nous["score"]]
+    dessus = [c for c in adversaires if c["score"] > nous["score"]]
+
+    # Menace : un clan derriere nous qui, au rythme qu'on lui connait,
+    # finirait au-dessus de notre plancher.
+    menace = [c for c in dessous
+              if c.get("attendu", c["moyenne"]) > nous["plancher"]]
+    # Menace seulement theorique : il lui faudrait jouer TOUS ses combats
+    # restants, ce que son rythme ne laisse pas presager.
+    menace_th = [c for c in dessous if c not in menace
+                 and c["plafond"] > nous["plancher"]]
+    # Proie : un clan devant nous qu'on peut encore passer.
+    proie = [c for c in dessus
+             if c.get("attendu", c["moyenne"]) < attendu_nous]
+    proie_th = [c for c in dessus if c not in proie
+                and c["plancher"] < nous["plafond"]]
+
+    note = ""
+    if menace_th:
+        pire_th = max(menace_th, key=lambda c: c["plafond"])
+        note = (" {} ne repasserait devant qu'en jouant ses {} combats "
+                "restants.").format(pire_th["nom"], pire_th["decks_restants"])
+
+    # --- 1. plus rien a defendre ni a gagner : la place est figee ---------
+    if not menace and not proie:
+        rang = 1 + len(dessus)
+        rang_txt = "1re" if rang == 1 else "{}e".format(rang)
+        return ("PLACE FIGEE", (
+            "{} place acquise : personne ne peut plus nous depasser, et nous "
+            "ne pouvons plus depasser personne. Les {} combats restants ne "
+            "rapportent plus un rang : passe-les sur les bateaux.{}"
+        ).format(rang_txt, restants, note), [(0, restants)])
+
+    # --- 2. une place est encore prenable, et personne ne nous menace -----
+    if proie and not menace:
+        cible = min(proie, key=lambda c: c.get("attendu", c["moyenne"]))
+        manque = max(0, cible.get("attendu", cible["moyenne"]) - attendu_nous)
+        combats = int(manque / max(1.0, nous["moyenne_deck"])) + 1
+        return ("UNE PLACE A PRENDRE", (
+            "{} est a notre portee : personne ne peut nous depasser, mais il "
+            "faut des points. Tous les combats sur les duels et les combats "
+            "classiques, pas de bateaux.{}"
+        ).format(cible["nom"], note), [(0, 0)])
+
+    # --- 3. il faut defendre notre place ----------------------------------
+    pire = max(menace, key=lambda c: c["plafond"])
+    marge_pessimiste = nous["plancher"] - pire["plafond"]
+    marge_realiste = attendu_nous - pire.get("attendu", pire["moyenne"])
+
     plan, vu = [], None
     for v in range(0, min(5, restants + 1)):
         b = budget_bateaux(nous, pire["plafond"], v)
-        if b == vu and v:                 # rien de neuf, on n'allonge pas
+        if b == vu and v:
             continue
         vu = b
         plan.append((v, b))
-        if b >= restants - v:             # budget sature : inutile d'aller plus loin
+        if b >= restants - v:
             break
 
     if marge_pessimiste > 0:
-        etiquette = "FEU VERT"
-        texte = ("Meme en perdant tout pendant que {} gagne tout, on reste "
-                 "devant ({} pts de marge). Les bateaux sont gratuits.").format(
-                     pire["nom"], fmt(marge_pessimiste))
-    elif marge_realiste <= 0:
-        etiquette = "STOP"
-        texte = ("{} nous depasse au rythme actuel ({} pts). "
-                 "Tous les decks sur les combats classiques.").format(
-                     realiste["nom"], fmt(-marge_realiste))
-    elif marge_realiste >= MARGE_CONFORTABLE:
-        etiquette = "PRUDENCE"
-        texte = ("Avance realiste de {} pts sur {}, mais le pire scenario nous "
-                 "fait passer derriere : joue les combats d'abord.").format(
-                     fmt(marge_realiste), realiste["nom"])
-    else:
-        etiquette = "STOP"
-        texte = ("Seulement {} pts d'avance realiste sur {} : trop court pour "
-                 "lacher des points.").format(fmt(marge_realiste), realiste["nom"])
-    return etiquette, texte, plan
+        return ("FEU VERT", (
+            "Meme en perdant tout pendant que {} gagne tout, notre place tient "
+            "({} pts de marge). Les bateaux sont gratuits.{}"
+        ).format(pire["nom"], fmt(marge_pessimiste), note), plan)
+    if marge_realiste <= 0:
+        return ("STOP", (
+            "{} nous passe devant au rythme actuel ({} pts) : notre place est "
+            "en jeu. Tous les combats classiques.{}"
+        ).format(pire["nom"], fmt(-marge_realiste), note), plan)
+    if marge_realiste >= MARGE_CONFORTABLE:
+        return ("PRUDENCE", (
+            "{} pts d'avance realiste sur {}, mais le pire scenario nous fait "
+            "perdre la place : joue les combats d'abord.{}"
+        ).format(fmt(marge_realiste), pire["nom"], note), plan)
+    return ("STOP", (
+        "Seulement {} pts d'avance sur {} : trop court pour lacher des "
+        "points.{}").format(fmt(marge_realiste), pire["nom"], note), plan)
 
 
 def lignes_plan(nous, plan):
@@ -711,7 +764,16 @@ def lignes_plan(nous, plan):
     tete = "Il reste **{}** combats".format(restants)
     if entames:
         tete += " : {} surs, {} entames".format(sur, entames)
-    out = [tete + ". Budget bateau garanti :"]
+    out = [tete + "."]
+    # Quand le verdict a deja tranche (place figee, ou place a prendre), la
+    # liste des paliers n'apprendrait rien : on s'en tient au decompte.
+    if len(plan) == 1 and plan[0][0] == 0:
+        if entames:
+            out.append("-# Les {} combats entames ne comptent pas dans le "
+                       "plancher : eux seuls peuvent les finir.".format(entames))
+        return out
+
+    out[0] = tete + ". Budget bateau garanti :"
     for v, b in plan:
         quand = "maintenant" if v == 0 else "apres {} victoire(s)".format(v)
         if b == 0:
